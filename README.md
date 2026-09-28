@@ -1,0 +1,307 @@
+# gllvmTMB
+
+<!-- badges: start -->
+[![R-CMD-check](https://github.com/itchyshin/gllvmTMB/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/itchyshin/gllvmTMB/actions/workflows/R-CMD-check.yaml)
+[![pkgdown](https://github.com/itchyshin/gllvmTMB/actions/workflows/pkgdown.yaml/badge.svg)](https://github.com/itchyshin/gllvmTMB/actions/workflows/pkgdown.yaml)
+[![Lifecycle: experimental](https://img.shields.io/badge/lifecycle-experimental-orange.svg)](https://lifecycle.r-lib.org/articles/stages.html#experimental)
+<!-- badges: end -->
+
+> [!WARNING]
+> **`gllvmTMB` is experimental; use at your own risk.** It is not complete, is
+> not fully human-verified, and needs extensive further validation. CRAN
+> availability is not a statement of scientific maturity. Point estimates are the
+> primary inferential output, but their evidence is route- and regime-specific.
+> Broad package-wide interval coverage is not certified;
+> one narrowly scoped two-sided Gaussian total-variance profile regime has a
+> documented 0.94 coverage floor. This is not nominal 95% certification or a
+> guarantee for an individual fit. Covariance routes otherwise have cell-specific
+> evidence only.
+
+`gllvmTMB` fits multivariate models for data where each site,
+individual, species, or study has several responses: body traits,
+species occurrences, behaviours, outcomes, or similar measurements.
+The main question is simple:
+
+> Which responses vary together, and how much of that variation is shared
+> versus response-specific?
+
+Unlike PCA or NMDS, `gllvmTMB` estimates latent structure **inside a
+likelihood** rather than from a distance matrix or eigen-decomposition.
+Loadings, correlations, and communalities can be paired with model-based
+uncertainty where a target-specific route is supported; broad interval
+calibration remains incomplete.
+
+## Start Here
+
+| If you want to... | Read this |
+|---|---|
+| fit your first model | [Get started with gllvmTMB](https://itchyshin.github.io/gllvmTMB/articles/gllvmTMB.html) |
+| decide whether your model and intended result are inside the current evidence boundary | [Current limitations and boundaries](https://itchyshin.github.io/gllvmTMB/articles/current-limits.html) |
+| choose the guide matching your data and question | [Browse all articles](https://itchyshin.github.io/gllvmTMB/articles/) |
+| check whether a fit is interpretable | [Can I trust this fit?](https://itchyshin.github.io/gllvmTMB/articles/fit-diagnostics.html) |
+| look up formulas, covariance terms, or families | [Reference index](https://itchyshin.github.io/gllvmTMB/reference/) |
+
+`gllvmTMB` is under active development and has lifecycle **experimental**: the
+formula grammar, defaults, and extractor output may still change as the API
+matures. The public path above is deliberately bounded. For Gaussian models,
+the narrow tested-regime point evidence starts with `indep()` or `dep()`; inspect
+the covariance point estimate. The latent model below remains the clearest way
+to learn `Sigma = Lambda Lambda^T + Psi` and interpret covariance point
+estimates. For a first point estimate in the narrow tested Gaussian setting,
+start with `indep()` or `dep()` and check fit health. Bare-bar `(1 + x | g)`
+slopes remain reserved.
+
+## What the model does
+
+The teaching example uses one ordinary Gaussian `latent()` model. It splits
+the trait covariance matrix into shared axes plus trait-specific variance:
+
+$$
+\boldsymbol{\Sigma}
+=
+\boldsymbol{\Lambda}\boldsymbol{\Lambda}^{\mathsf T}
++
+\boldsymbol{\Psi},
+\qquad
+\boldsymbol{\Psi}
+=
+\operatorname{diag}(\psi_1,\ldots,\psi_T).
+$$
+
+In words: total trait covariance = shared multivariate structure +
+response-specific variation. Read the equation from left to right:
+
+| Model piece | R syntax | What it means |
+|---|---|---|
+| `Sigma` | `extract_Sigma_table(fit, level = "unit")` | The total covariance among traits, one report-ready row per entry. This is usually the first report-ready target. |
+| `Lambda` | `latent(..., d = K)` | The loading matrix: one row per trait and one column per latent axis. Its raw entries are rotation-dependent, so start interpretation from `Sigma`, correlations, or communality. |
+| `Lambda Lambda^T` | `extract_Sigma(fit, part = "shared")` | Shared axes: traits that rise and fall together across units. |
+| `Psi` | ordinary `latent(...)` by default | Trait-specific variance left over after the shared axes. Each diagonal entry is one `psi_t`. |
+
+Use `latent(...)` for this decomposed model, and `indep(...)` for a
+standalone diagonal baseline.
+
+## Choose a covariance source and level
+
+The grouping factor says where a component varies; the keyword family says
+what covariance structure it uses. In older output, `B` means between-unit
+(`unit`) and `W` means within-unit observations (`unit_obs`). A `unit_obs`
+level must be nested within one `unit`.
+
+| Component | Keyword family | What identifies it |
+|---|---|---|
+| Between-unit or within-unit covariance | `indep()`, `dep()`, `latent()` | Use the `unit` or `unit_obs` grouping factor in the formula. |
+| Animal relatedness | `animal_indep()`, `animal_dep()`, `animal_latent()` | Supply a pedigree, `A`, or `Ainv` for the animal IDs. |
+| Phylogenetic relatedness | `phylo_indep()`, `phylo_dep()`, `phylo_latent()` | Supply a tree or `vcv` matrix for the cluster axis, usually species. |
+| Spatial fields | `spatial_indep()`, `spatial_dep()`, `spatial_latent()` | Supply a mesh built from the fitted locations. |
+| Known kernel | `kernel_indep()`, `kernel_dep()`, `kernel_latent()` | Supply the relatedness or similarity matrix `K`. |
+
+The mode describes covariance among traits: `indep()` gives separate trait
+variances with no cross-trait covariance; `dep()` estimates an unstructured
+trait covariance; and `latent(..., d = K)` estimates a rank-`K` shared
+component. Ordinary `latent()` includes its diagonal `Psi` companion by
+default. For a source-specific `*_latent()` term, set `unique = TRUE` when the
+source-specific diagonal `Psi` is intended. The older paired form
+`latent(..., unique = FALSE) + unique(...)` remains accepted for compatibility;
+new ordinary fits can write `latent(...)` alone. These terms can be combined
+only in the regimes documented for the selected family and covariance source.
+
+Most readers will start from a wide data frame: one row per unit, one
+column per trait. Use that shape directly with the `traits(...)` formula
+marker. If your data are already stacked long, use the same `gllvmTMB()`
+entry point with `value ~ ...`, `trait =`, and `unit =`. Internally, both
+paths reach the same stacked-trait model.
+
+## What "stacked-trait" Means
+
+The user-facing data shape can be wide or long. The model itself is
+stacked-trait: internally, every fit sees one row per `(unit, trait)`
+observation. Five traits on 100 individuals become 500 model rows. The
+wide `traits(...)` interface does that stacking for you; the long
+interface lets you supply the stacked table yourself.
+
+## Install
+
+Once the first CRAN release has been accepted and published, install the
+released package with:
+
+```r
+install.packages("gllvmTMB")
+```
+
+To install the unreleased development build from GitHub, use `pak`:
+
+```r
+install.packages("pak")
+pak::pak("itchyshin/gllvmTMB")
+```
+
+The online site documents the current development branch and may describe
+features absent from 0.7.1. For this release, use the help pages and vignette
+installed with the package.
+
+Then load the package and run a small smoke test:
+
+```r
+library(gllvmTMB)
+
+set.seed(1)
+n_ind <- 30
+n_rep <- 3
+individual <- factor(rep(seq_len(n_ind), each = n_rep))
+
+z <- rnorm(n_ind)[individual]
+u <- matrix(rnorm(n_ind * 3, sd = 0.35), n_ind, 3)[individual, ]
+
+df_wide <- data.frame(
+  individual = individual,
+  visit = rep(seq_len(n_rep), times = n_ind),
+  bill_length = 0.8 * z + u[, 1] + rnorm(n_ind * n_rep, sd = 0.5),
+  body_mass = 0.5 * z + u[, 2] + rnorm(n_ind * n_rep, sd = 0.5),
+  wing_length = -0.3 * z + u[, 3] + rnorm(n_ind * n_rep, sd = 0.5)
+)
+
+fit <- gllvmTMB(
+  traits(bill_length, body_mass, wing_length) ~ 1 +
+    latent(1 | individual, d = 1),
+  data = df_wide,
+  unit = "individual"
+)
+
+fit
+extract_communality(fit, level = "unit")
+extract_Sigma_table(fit, level = "unit")
+```
+
+You need R 4.1.0 or newer and a working compiler toolchain because
+TMB models are compiled during installation. If installation fails
+while compiling C++, install the usual R build tools for your
+platform: Rtools on Windows, Xcode Command Line Tools on macOS,
+or the R development toolchain on Linux.
+
+## Data shapes: wide or long, one entry point
+
+One entry point handles both shapes. Start with wide data if that is
+what you have on disk; use long data when your workflow already stores
+one response per row.
+
+- **Wide data frame** -- one row per unit, one column per trait. The
+  `traits(...)` LHS marker names the response columns and the RHS uses
+  compact wide shorthand (no `trait =` argument needed -- the LHS *is*
+  the trait spec):
+  ```r
+  gllvmTMB(traits(t1, t2, t3) ~ 1 + latent(1 | unit, d = 2),
+           data = df_wide, unit = "unit")
+  ```
+- **Long data frame** -- one row per `(unit, trait)` observation, one
+  `value` column for the response:
+  ```r
+  gllvmTMB(value ~ 0 + trait + latent(0 + trait | unit, d = 2),
+           data = df_long, trait = "trait", unit = "unit")
+  ```
+
+Predictors go into the formula in either form, and both forms describe the
+same stacked-trait model. The [Get started](https://itchyshin.github.io/gllvmTMB/articles/gllvmTMB.html)
+vignette fits one example both ways and checks that the log-likelihoods agree.
+
+Missing response cells are allowed. In a wide `traits(...)` data frame,
+an `NA` trait value can be treated as an unobserved unit-trait cell; in
+long data, an `NA` in the response column is treated the same way. The
+other observed traits for that unit stay in the likelihood, and
+`predict_missing()` reconstructs masked response cells when
+`missing = miss_control(response = "include")` is used. Missing predictors
+default to fail-loud, but one explicitly modelled `mi()` predictor is
+supported through `missing = miss_control(predictor = "model")` and
+`impute = list(...)` for the covered native-Laplace Gaussian, grouped,
+phylogenetic, binary, ordered, and unordered fixed-effect routes. VA refuses
+modelled `mi()` predictors. **Do not treat parser support as an NB2 reliability
+claim:** the frozen NB2 latent missing-response cell produced catastrophic
+dispersion failures that ordinary fit diagnostics often missed; that route is
+not recommended for dependable inference. Ordinary missing
+grouping variables, offsets, weights, or design-matrix values still error
+because the model cannot build that row.
+
+## Current support boundary
+
+The canonical reader-facing boundary is
+[Current limitations and boundaries](https://itchyshin.github.io/gllvmTMB/articles/current-limits.html).
+Read it before choosing a family, covariance source, estimator, or interval
+method. In brief:
+
+- start from an ordinary native-Laplace model and inspect fit health;
+- interpret rotation-invariant `Sigma`, correlations, and communality before
+  raw loading columns;
+- treat structured sources, slopes, alternative integration engines, and most
+  non-Gaussian combinations as experimental or partial unless their guide names
+  the evidence regime;
+- do not infer interval calibration from the availability of Wald, bootstrap,
+  or profile bounds.
+
+The first-fit correlation example reports point estimates only; profile
+intervals for correlations are unavailable. The separate
+`profile_ci_total_variance()` route targets diagonal per-trait total variance,
+not correlation. Open its installed help with `?profile_ci_total_variance`
+for the returned `lower`, `upper`, and `interval_status` columns. Its
+`certified-0.94` label marks membership in one simulated regime; it is not
+nominal 95% coverage or a guarantee for an individual fit. Other computed
+rows are labelled `route-only` and do not carry that coverage evidence.
+
+`gllvmTMB` is for stacked-trait multivariate models. Use `glmmTMB` for a
+single-response GLMM, `sdmTMB` for a single-response spatial model, and
+`drmTMB` for one- or two-response distributional regression.
+
+## Citation and acknowledgements
+
+If you use gllvmTMB, please cite the package and its TMB engine.
+Run `citation("gllvmTMB")` for formatted entries:
+
+- **gllvmTMB**: Nakagawa S (2026). *gllvmTMB: Generalised Linear
+  Latent Variable Models with TMB.* R package version 0.7.1.
+  <https://itchyshin.github.io/gllvmTMB/>
+- **TMB engine**: Kristensen K, Nielsen A, Berg CW, Skaug H,
+  Bell BM (2016). *TMB: Automatic Differentiation and Laplace
+  Approximation.* Journal of Statistical Software, 70(5), 1-21.
+  <https://doi.org/10.18637/jss.v070.i05>
+The current spatial helpers were substantially rewritten in gllvmTMB against
+the published SPDE/GMRF construction and public `fmesher` API after an earlier
+implementation derived from the GPL-3 `sdmTMB` helpers. We retain sdmTMB
+attribution in `inst/COPYRIGHTS`; the current implementation is covered by
+focused tests, while the broader spatial family remains partial. TMB
+itself is a runtime dependency rather than included code. Most of the
+gllvmTMB C++ engine in `src/gllvmTMB.cpp` is original package code written
+against the TMB API; `inst/COPYRIGHTS` separately records the same-author
+GPL-3 numerical and missing-predictor code reused from `drmTMB`.
+See the [spatial-model guide](https://itchyshin.github.io/gllvmTMB/articles/spatial-models.html#provenance-acknowledgement-and-licensing)
+for the public provenance, acknowledgement, and GPL-3 explanation.
+
+## Sister packages
+
+- `drmTMB` fits univariate and bivariate distributional
+  regression, including location-scale and bivariate
+  residual-correlation models.
+- `glmmTMB` fits single-response GLMMs.
+- `sdmTMB` fits spatial single-response models; `gllvmTMB` fits
+  multivariate stacked-trait spatial models through its own `spatial_*()`
+  helper layer.
+- `gllvm` (Niku et al. 2019; Korhonen et al. 2025 for `gllvm`
+  2.0) is the established multivariate GLLVM / ordination package,
+  with variational, extended-variational, and Laplace approximation
+  paths plus a matrix-in API; `gllvmTMB` is the TMB-Laplace
+  alternative with stacked-trait formula grammar and the three-mode
+  covariance-keyword grid plus `common` and `unique` modifiers.
+- `MCMCglmm` and `brms` are Bayesian alternatives for multivariate
+  phylogenetic / multi-response models; `gllvmTMB` returns ML point
+  estimates with profile, Wald, or bootstrap routes where supported. Method
+  availability does not establish calibrated interval coverage; follow the
+  boundary in the relevant guide before reporting uncertainty.
+
+A full scope comparison and decision matrix lives in
+[`docs/design/04-sister-package-scope.md`](https://github.com/itchyshin/gllvmTMB/blob/main/docs/design/04-sister-package-scope.md)
+on GitHub.
+
+## Support boundary
+
+Reader-facing support is defined by the current guides linked above. A formula
+being accepted by the parser does not guarantee that its covariance parameters
+are estimable from a particular data set; check fit health and the boundary in
+the relevant guide before interpreting a model.

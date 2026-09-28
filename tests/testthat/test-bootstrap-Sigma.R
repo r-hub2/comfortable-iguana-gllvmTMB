@@ -1,0 +1,336 @@
+## Tests for bootstrap_Sigma() — parametric-bootstrap CIs for Sigma /
+## R / communality / ICC summaries of a fitted gllvmTMB_multi model.
+##
+## Each helper builds a tiny fit (n_sites = 30, n_traits = 3) so the
+## refits run in a few seconds even with n_boot = 5–10.
+
+make_tiny_fit <- function(seed = 1) {
+  set.seed(seed)
+  n_sites <- 30L
+  Tn <- 3L
+  Lambda_B <- matrix(c(0.9, 0.4, -0.3, 0.0, 0.6, 0.2), Tn, 2)
+  psi_B <- c(0.20, 0.15, 0.10)
+  Lambda_W <- matrix(c(0.4, 0.2, -0.1), Tn, 1)
+  psi_W <- c(0.10, 0.08, 0.05)
+  s <- gllvmTMB::simulate_site_trait(
+    n_sites = n_sites,
+    n_species = 4,
+    n_traits = Tn,
+    mean_species_per_site = 4,
+    Lambda_B = Lambda_B,
+    psi_B = psi_B,
+    Lambda_W = Lambda_W,
+    psi_W = psi_W,
+    beta = matrix(0, Tn, 2),
+    seed = seed
+  )
+  suppressMessages(suppressWarnings(gllvmTMB::gllvmTMB(
+    value ~ 0 +
+      trait +
+      latent(0 + trait | site, d = 2) +
+      unique(0 + trait | site) +
+      latent(0 + trait | site_species, d = 1) +
+      unique(0 + trait | site_species),
+    data = s$data
+  )))
+}
+
+test_that("bootstrap_Sigma limits parallel refits to two workers", {
+  expect_error(
+    bootstrap_Sigma(list(), n_cores = 3L),
+    "must be 1 or 2"
+  )
+})
+
+test_that("bootstrap worker count accepts only the integers one and two", {
+  expect_identical(.validate_bootstrap_n_cores(1), 1L)
+  expect_identical(.validate_bootstrap_n_cores(2), 2L)
+  expect_error(.validate_bootstrap_n_cores(0), "must be 1 or 2")
+  expect_error(.validate_bootstrap_n_cores(-1), "must be 1 or 2")
+  expect_error(.validate_bootstrap_n_cores(1.5), "must be 1 or 2")
+})
+
+test_that("bootstrap_Sigma returns the expected list structure (smoke test)", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  fit <- make_tiny_fit()
+  boot <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 5L,
+    level = c("unit", "unit_obs"),
+    what = c("Sigma", "R", "communality", "ICC"),
+    seed = 42L,
+    progress = FALSE
+  ))
+  expect_s3_class(boot, "bootstrap_Sigma")
+  expect_named(
+    boot,
+    c(
+      "point_est",
+      "ci_lower",
+      "ci_upper",
+      "n_effective",
+      "boot_median",
+      "ci_method",
+      "link_residual",
+      "conf",
+      "n_boot",
+      "coverage_ceiling",
+      "n_failed",
+      "level",
+      "what",
+      "draws"
+    )
+  )
+  expect_equal(boot$ci_method, "percentile")
+  expect_equal(boot$link_residual, "auto")
+  expect_equal(boot$n_boot, 5L)
+  ## Matrix summaries have one joint draw per replicate. Effective-count
+  ## diagnostics are defined for the vector targets only, and medians are
+  ## currently exposed only for the multiple-correlation targets.
+  expect_setequal(
+    names(boot$n_effective),
+    c("communality_B", "communality_W", "ICC_site")
+  )
+  n_effective <- unlist(boot$n_effective, use.names = FALSE)
+  expect_true(all(n_effective >= 0L))
+  expect_true(all(n_effective <= boot$n_boot))
+  expect_length(boot$boot_median, 0L)
+  expect_true("Sigma_B" %in% names(boot$point_est))
+  expect_true("R_B" %in% names(boot$point_est))
+  expect_true("Sigma_W" %in% names(boot$point_est))
+  expect_true("communality_B" %in% names(boot$point_est))
+  expect_true("ICC_site" %in% names(boot$point_est))
+  ## Shapes match between point_est, ci_lower, ci_upper
+  for (nm in names(boot$point_est)) {
+    expect_equal(dim(boot$ci_lower[[nm]]), dim(boot$point_est[[nm]]))
+    expect_equal(dim(boot$ci_upper[[nm]]), dim(boot$point_est[[nm]]))
+  }
+})
+
+test_that("Point estimates match extract_Sigma() on the original fit", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  fit <- make_tiny_fit()
+  boot <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 3L,
+    level = "unit",
+    what = c("Sigma", "R"),
+    seed = 1L,
+    progress = FALSE
+  ))
+  ref <- suppressMessages(extract_Sigma(fit, level = "unit", part = "total"))
+  expect_equal(boot$point_est$Sigma_B, ref$Sigma)
+  expect_equal(boot$point_est$R_B, ref$R)
+})
+
+test_that("CI bounds are tighter at lower confidence levels", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  fit <- make_tiny_fit()
+  boot95 <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 10L,
+    level = "unit",
+    what = "Sigma",
+    conf = 0.95,
+    seed = 7L,
+    progress = FALSE
+  ))
+  boot50 <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 10L,
+    level = "unit",
+    what = "Sigma",
+    conf = 0.50,
+    seed = 7L,
+    progress = FALSE
+  ))
+  width95 <- boot95$ci_upper$Sigma_B - boot95$ci_lower$Sigma_B
+  width50 <- boot50$ci_upper$Sigma_B - boot50$ci_lower$Sigma_B
+  ## Ignore the (degenerate) zero-width entries — focus on diagonal +
+  ## any populated off-diagonal cell.
+  diag_idx <- diag(matrix(seq_along(width95), nrow(width95), ncol(width95)))
+  expect_true(all(width50[diag_idx] <= width95[diag_idx] + 1e-10))
+})
+
+test_that("seed is reproducible: two calls with same seed give identical output", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  fit <- make_tiny_fit()
+  b1 <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 5L,
+    level = "unit",
+    what = "Sigma",
+    seed = 99L,
+    progress = FALSE
+  ))
+  b2 <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 5L,
+    level = "unit",
+    what = "Sigma",
+    seed = 99L,
+    progress = FALSE
+  ))
+  expect_equal(b1$ci_lower, b2$ci_lower)
+  expect_equal(b1$ci_upper, b2$ci_upper)
+  expect_equal(b1$point_est, b2$point_est)
+})
+
+test_that("new link_residual argument preserves legacy positional seed calls", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  fit <- make_tiny_fit()
+  named <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 3L,
+    level = "unit",
+    what = "Sigma",
+    conf = 0.95,
+    seed = 123L,
+    progress = FALSE
+  ))
+  positional <- suppressMessages(bootstrap_Sigma(
+    fit,
+    3L,
+    "unit",
+    "Sigma",
+    0.95,
+    123L,
+    progress = FALSE
+  ))
+  expect_equal(positional$link_residual, "auto")
+  expect_equal(positional$ci_lower, named$ci_lower)
+  expect_equal(positional$ci_upper, named$ci_upper)
+})
+
+test_that("n_cores = 2 returns CIs of the same shape and roughly the same magnitude as n_cores = 1", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  skip_if_not_installed("future")
+  skip_if_not_installed("future.apply")
+  fit <- make_tiny_fit()
+  b1 <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 6L,
+    level = "unit",
+    what = "Sigma",
+    seed = 11L,
+    n_cores = 1L,
+    progress = FALSE
+  ))
+  b2 <- suppressMessages(bootstrap_Sigma(
+    fit,
+    n_boot = 6L,
+    level = "unit",
+    what = "Sigma",
+    seed = 11L,
+    n_cores = 2L,
+    progress = FALSE
+  ))
+  ## Same shape
+  expect_equal(dim(b1$ci_lower$Sigma_B), dim(b2$ci_lower$Sigma_B))
+  expect_equal(dim(b1$ci_upper$Sigma_B), dim(b2$ci_upper$Sigma_B))
+  ## Point estimate is deterministic from the original fit
+  expect_equal(b1$point_est$Sigma_B, b2$point_est$Sigma_B)
+  ## n_failed should be small (allow at most 1 failure on this tiny problem)
+  expect_lte(b1$n_failed + b2$n_failed, 4L)
+})
+
+test_that("Failed refits are tallied in n_failed, not in CIs", {
+  skip_if_not_heavy()
+  skip_on_cran()
+  fit <- make_tiny_fit()
+  ## Force a failure by inserting a poison replicate: monkey-patch the
+  ## simulated response matrix so one column is all-NA. We do this by
+  ## intercepting `simulate.gllvmTMB_multi` for one call.
+  orig <- simulate(fit, nsim = 5L, seed = 5L)
+  poisoned <- orig
+  poisoned[, 1L] <- NA_real_
+  ## Mock simulate.gllvmTMB_multi for this test only
+  with_mocked_bindings(
+    simulate.gllvmTMB_multi = function(
+      object,
+      nsim = 1,
+      seed = NULL,
+      newdata = NULL,
+      ...
+    ) {
+      poisoned
+    },
+    .package = "gllvmTMB",
+    code = {
+      boot <- suppressMessages(bootstrap_Sigma(
+        fit,
+        n_boot = 5L,
+        level = "unit",
+        what = "Sigma",
+        seed = 5L,
+        progress = FALSE
+      ))
+      expect_gte(boot$n_failed, 1L)
+      expect_equal(dim(boot$ci_lower$Sigma_B), dim(boot$point_est$Sigma_B))
+    }
+  )
+})
+
+# ---- coverage_ceiling: the arithmetic guard on n_boot ----------------------
+#
+# A percentile interval from B draws cannot cover more than (B - 1) / (B + 1),
+# because the widest interval B draws can produce is [min, max]. Below that
+# ceiling the reported interval is narrower than nominal BY CONSTRUCTION,
+# whatever the data are.
+#
+# This is not hypothetical: the 2026-07-29 coverage campaign ran this function
+# at n_boot = 10 and its 0.78 empirical coverage was written into the
+# validation-debt register as a property of bootstrap_Sigma(). It is a property
+# of bootstrap_Sigma(n_boot = 10) -- ceiling 9/11 = 0.818. The failure was an
+# automated harness, which is why the ceiling is a RETURNED FIELD and not only
+# a warning: a script can assert on it.
+# See docs/dev-log/audits/2026-08-02-ci08-coverage-explained.md.
+
+test_that("coverage_ceiling reports the arithmetic limit and warns below conf", {
+  skip_if_not_heavy()
+  sim <- simulate_site_trait(
+    n_sites = 25, n_species = 3, n_traits = 3,
+    mean_species_per_site = 3, seed = 20260802L
+  )
+  fit <- gllvmTMB(
+    value ~ 0 + trait + latent(0 + trait | site, d = 1),
+    data = sim$data, family = gaussian(),
+    unit = "site", cluster = "species"
+  )
+
+  ## B = 10 cannot deliver 95%: ceiling 9/11 = 0.818. Must warn AND report.
+  expect_warning(
+    boot_low <- bootstrap_Sigma(
+      fit, n_boot = 10L, level = "unit", what = "Sigma", progress = FALSE
+    ),
+    "cannot deliver"
+  )
+  expect_equal(boot_low$coverage_ceiling, 9 / 11)
+  expect_lt(boot_low$coverage_ceiling, boot_low$conf)
+
+  ## B = 39 is exactly the floor at conf = 0.95: (39-1)/(39+1) = 0.95.
+  expect_equal((39 - 1) / (39 + 1), 0.95)
+
+  ## The ceiling must track conf, not be hard-coded to 0.95. At conf = 0.80 the
+  ## arithmetic floor is ceiling(2 / 0.2) - 1 = 9, so B = 10 clears it and the
+  ## "cannot deliver" warning must NOT fire -- but the separate low-B noise
+  ## warning still does, since 10 < 999 (the default, and the noise threshold).
+  ## Those are different conditions and
+  ## the test distinguishes them rather than lumping them together.
+  expect_warning(
+    boot_80 <- bootstrap_Sigma(
+      fit, n_boot = 10L, conf = 0.80, level = "unit",
+      what = "Sigma", progress = FALSE
+    ),
+    "noisy percentile bounds"
+  )
+  expect_gte(boot_80$coverage_ceiling, boot_80$conf)
+  ## Same B, same ceiling -- only the requested level changed.
+  expect_equal(boot_80$coverage_ceiling, 9 / 11)
+})

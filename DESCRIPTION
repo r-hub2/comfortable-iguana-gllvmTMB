@@ -1,0 +1,49 @@
+Type: Package
+Package: gllvmTMB
+Title: Generalised Linear Latent Variable Models with TMB
+Version: 0.7.1
+Authors@R: 
+    person("Shinichi", "Nakagawa", , "itchyshin@gmail.com",
+           role = c("aut", "cre", "cph"),
+           comment = c(ORCID = "0000-0002-7765-5182"))
+Description: Fits multivariate generalised linear latent variable models using
+    either long-format data or a wide data frame. Models support several
+    response distributions and trait covariance structures, and can estimate
+    correlations, shared latent axes, and trait-specific variances. Binary
+    presence-absence data can be used for joint species distribution analyses.
+    Optional animal, phylogenetic, spatial, and kernel covariance
+    components are available. Estimation uses 'Template Model Builder'. Spatial
+    effects can use sparse Gaussian Markov random field constructions. This
+    0.7.1 release remains experimental: evidence for estimates is model- and
+    regime-specific. Broad interval coverage is not certified; a 0.94 coverage
+    floor is documented only for one two-sided Gaussian total-variance profile
+    setting.
+License: GPL-3
+Language: en-GB
+Copyright: inst/COPYRIGHTS
+URL: https://itchyshin.github.io/gllvmTMB/,
+        https://github.com/itchyshin/gllvmTMB
+BugReports: https://github.com/itchyshin/gllvmTMB/issues
+Depends: R (>= 4.1.0)
+Imports: assertthat, cli, fmesher, generics, graphics, lifecycle,
+        Matrix, methods, rlang, stats, tidyselect, TMB (>= 1.8.0),
+        utils
+LinkingTo: BH, RcppEigen, TMB
+Suggests: ape, DHARMa, detectseparation (>= 0.4.0), dplyr, future,
+        future.apply, ggforce, ggplot2, galamm, glmmTMB, gllvm,
+        JuliaCall, jsonlite, knitr, lme4, MASS, MCMCglmm, mgcv, mirt,
+        mvtnorm, nadiv, rmarkdown, sf, testthat (>= 3.0.0), tibble,
+        tidyr, tweedie, vegan, vdiffr, withr
+VignetteBuilder: knitr
+ByteCompile: true
+Config/testthat/edition: 3
+Config/testthat/parallel: false
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+SystemRequirements: GNU make, C++17
+Config/roxygen2/version: 8.0.0
+NeedsCompilation: yes
+Packaged: 2026-09-28 21:36:05 UTC; z3437171
+Author: Shinichi Nakagawa [aut, cre, cph] (ORCID:
+    <https://orcid.org/0000-0002-7765-5182>)
+Maintainer: Shinichi Nakagawa <itchyshin@gmail.com>

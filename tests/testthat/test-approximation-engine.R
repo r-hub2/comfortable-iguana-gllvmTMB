@@ -1,0 +1,192 @@
+test_that("approximation contract remains research-only and non-likelihood", {
+  result <- .approximation_engine_result(
+    engine = "va_r3", objective_type = "ELBO_GH",
+    diagnostics = list(convergence = 0L), provenance = list(),
+    score = list(
+      negative_elbo_gh = 1,
+      direction = "minimize",
+      model_selection_comparable = FALSE
+    )
+  )
+
+  expect_s3_class(result, "gllvmTMB_approximation_result")
+  expect_identical(result$engine, "va_r3")
+  expect_identical(result$objective_type, "ELBO_GH")
+  expect_true(isTRUE(result$research_only))
+  expect_named(
+    result,
+    c("engine", "objective_type", "research_only", "admitted_regime",
+      "diagnostics", "provenance", "score", "fixed", "fitted", "status",
+      "evaluation", "engine_result")
+  )
+  expect_false(any(c("logLik", "AIC", "BIC") %in% names(result)))
+  expect_identical(result$score$direction, "minimize")
+  expect_false(isTRUE(result$score$model_selection_comparable))
+})
+
+test_that("VA-R3 rejects unsupported regime before objective construction", {
+  y <- c(1, 2, 3, 0)
+  trials <- rep(4L, 4L)
+  X <- cbind(1, c(-1, 1, -1, 1))
+  unit <- rep(1:2, each = 2)
+  trait <- rep(1:2, 2)
+
+  ## Design 108 Gate A Stage 6 lifted this adapter's `unique` refusal IN
+  ## LOCKSTEP with .va_r3_validate_data(), and Stage 7 lifted `structured` the
+  ## same way. The assertion is that the two gates AGREE: the adapter must
+  ## refuse exactly what the validator refuses, no more and no less. A
+  ## duplicated gate that drifts is worse than one gate, because the adapter
+  ## would refuse a model the engine admits -- or admit one by a second route
+  ## after the engine relaxed.
+  ##
+  ## `structured = TRUE` is still refused, on a sharper ground than before: a
+  ## structured tier means nothing without the precision it is structured BY,
+  ## so the admitted form is a list carrying `Ainv`.
+  expect_error(
+    .approximation_engine_va_r3_fit(
+      y, trials, X, unit, trait, q = 1L, structured = TRUE
+    ),
+    "must be FALSE, or a list"
+  )
+  expect_error(
+    .approximation_engine_va_r3_fit(
+      y, trials, X, unit, trait, q = 1L, provider = list(kind = "phylo")
+    ),
+    "no structured provider"
+  )
+  expect_error(
+    .approximation_engine_va_r3_fit(
+      y, rep(0L, 4L), X, unit, trait, q = 1L
+    ),
+    "n_trials >= 1"
+  )
+  expect_error(
+    .approximation_engine_va_r3_fit(
+      y, trials, X, unit, trait, q = 1L, link = "probit"
+    ),
+    "binomial-logit"
+  )
+})
+
+test_that("VA-R3 rank-zero result is normalised without compiling an objective", {
+  y <- c(1, 2, 3, 0)
+  trials <- rep(4L, 4L)
+  X <- cbind(1, c(-1, 1, -1, 1))
+  unit <- rep(1:2, each = 2)
+  trait <- rep(1:2, 2)
+
+  result <- .approximation_engine_fit(
+    "va_r3", y, trials, X, unit, trait, q = 0L
+  )
+  expect_identical(result$status, "not_applicable_rank_zero")
+  ## The private registry resolves `auto` to GH for every scalar cell. The
+  ## public formula route still explicitly selects JJ for pure binomial-logit
+  ## until Gate E authorises the H=7 promotion.
+  expect_identical(result$objective_type, "ELBO_GH")
+  expect_true(isTRUE(result$research_only))
+  expect_false(isTRUE(result$fitted$objective_constructed))
+  expect_true(is.na(result$score$negative_elbo_gh))
+  expect_identical(result$score$direction, "minimize")
+  expect_false(isTRUE(result$score$model_selection_comparable))
+  expect_identical(
+    result$admitted_regime$trials,
+    "complete cells (binomial: integer n_trials >= 1; Poisson: no trials)"
+  )
+})
+
+test_that("VA adapter forwards fixed Tweedie power and Student df", {
+  captured <- NULL
+  fake_fit <- function(...) {
+    captured <<- list(...)
+    list(
+      status = "healthy", objective_type = "ELBO_GH", q = 1L,
+      fixed_global = FALSE, source_commit = NA_character_,
+      source_checksum = NA_character_, rank_source = "fixed_fixture",
+      eval_method = "gh", health = list(admitted = TRUE),
+      best = list(convergence = 0L, max_abs_gradient = 0,
+                  objective = 1, par = c(beta = 0)),
+      objective = list()
+    )
+  }
+  testthat::local_mocked_bindings(.va_r3_fit = fake_fit, .package = "gllvmTMB")
+
+  result <- .approximation_engine_va_r3_fit(
+    y = c(1.2, 0.8, 1.1, 0.9), n_trials = rep(1L, 4L),
+    X = matrix(1, 4L, 1L),
+    unit_id = c(0L, 0L, 1L, 1L), trait_id = c(0L, 1L, 0L, 1L),
+    q = 1L, N = 2L, T = 2L,
+    family_codes = c(6L, 9L, 6L, 9L), link_ids = rep(0L, 4L),
+    eval_method = "gh",
+    fixed_tweedie_power = c(1.6, NA_real_),
+    fixed_student_df = c(NA_real_, 7)
+  )
+
+  expect_identical(result$status, "healthy")
+  expect_equal(captured$fixed_tweedie_power, c(1.6, NA_real_))
+  expect_equal(captured$fixed_student_df, c(NA_real_, 7))
+})
+
+test_that("EVA rejects unsupported inputs before Gate-1 objective construction", {
+  ## The data-accepting path admits binomial-logit, Poisson-log, and the
+  ## Gaussian-identity test anchor; anything outside that surface is rejected
+  ## before an objective is constructed.
+  expect_error(
+    .approximation_engine_eva_fit(family = "gamma"),
+    "binomial-logit, Poisson-log, or Gaussian-identity"
+  )
+  expect_error(
+    .approximation_engine_eva_fit(family = "binomial", link = "probit"),
+    "binomial-logit, Poisson-log, or Gaussian-identity"
+  )
+  expect_error(
+    .approximation_engine_eva_fit(unique = TRUE),
+    "unique = FALSE"
+  )
+  ## An admitted family still has to supply data: q is validated first.
+  expect_error(
+    .approximation_engine_eva_fit(family = "binomial"),
+    "q must be one integer in 1\\.\\.6"
+  )
+})
+
+test_that("EVA fixture evaluation is reached only via the fixture argument", {
+  ## The legacy fixed-coordinate Gate-1 path keeps its Bernoulli-only regime,
+  ## now dispatched by `fixture =` rather than by the absence of data.
+  expect_error(
+    .approximation_engine_eva_fit(fixture = "bernoulli", family = "poisson"),
+    "Bernoulli-logit"
+  )
+})
+
+test_that("EVA reports an unavailable sealed helper instead of widening scope", {
+  has_eva <- exists(".eva_fixture", envir = environment(), inherits = TRUE)
+  if (has_eva) skip("The sealed EVA helper is present in this integration checkout.")
+
+  expect_error(
+    .approximation_engine_eva_fit(),
+    "sealed EVA Gate-1 helpers are unavailable"
+  )
+})
+
+test_that("EVA normalises a fixed Gate-1 evaluation without optimisation", {
+  skip_if_not_installed("TMB")
+  skip_if_not_installed("jsonlite")
+  if (!exists(".eva_fixture", envir = environment(), inherits = TRUE)) {
+    skip("The sealed EVA helper is not present in this checkout.")
+  }
+
+  result <- .approximation_engine_fit("eva", fixture = "bernoulli")
+  expect_identical(result$engine, "eva")
+  expect_identical(result$objective_type, "EVA_TAYLOR2")
+  expect_identical(result$status, "evaluated_fixed_gate1_fixture")
+  expect_true(isTRUE(result$research_only))
+  expect_true(is.na(result$diagnostics$convergence))
+  expect_true(is.finite(result$diagnostics$max_abs_gradient))
+  expect_true(is.finite(result$score$negative_ell_eva_taylor2))
+  expect_identical(result$score$direction, "minimize")
+  expect_false(isTRUE(result$score$model_selection_comparable))
+  expect_false(isTRUE(result$fitted$available))
+  expect_match(result$fitted$reason, "fixed-coordinate evaluation")
+  expect_true(is.finite(result$evaluation$negative_ell_eva_taylor2))
+  expect_true(is.list(result$evaluation$report))
+})

@@ -1,0 +1,848 @@
+## extract_Omega() / extract_phylo_signal() / extract_proportions() /
+## extract_residual_split():
+## convenience layers on top of extract_Sigma() for the multi-tier PGLLVM
+## decomposition.
+## See also: extract_residual_split() for separating the per-trait OLRE
+## variance sigma^2_e from the distribution-specific sigma^2_d.
+
+#' Separate OLRE residual variance from the distribution-specific latent
+#' residual
+#'
+#' For an additive overdispersion (OLRE) model
+#' \deqn{\eta_{it} = \mathbf{X}\boldsymbol\beta + \ldots + e_{it},
+#'        \quad e_{it} \sim N(0, \sigma^2_e),}
+#' the total latent-scale residual variance for trait \eqn{t} is
+#' \deqn{\sigma^2_{d,t} + \sigma^2_{e,t},}
+#' where \eqn{\sigma^2_d} is the **distribution-specific (theoretical)**
+#' component that depends only on the family/link, and \eqn{\sigma^2_e}
+#' is the **estimated OLRE variance** -- the per-trait diagonal of the
+#' within-unit residual covariance \eqn{\boldsymbol{\Psi}_W}.
+#'
+#' The function detects whether the fit includes a genuine observation-level
+#' random effect: normally a per-row `indep(0 + trait | <obs-level>)` term.
+#' When every (trait, obs) cell has one row per observation level per trait,
+#' `sigma2_e` is populated; otherwise it is zero.
+#'
+#' ## Terminology note
+#'
+#' Nakagawa & Schielzeth (2010) use \eqn{\sigma^2_d} for both components.
+#' Nakagawa, Johnson & Schielzeth (2017) §7 refine the terminology:
+#' \eqn{\sigma^2_d} (distribution-specific) applies only to binomial-type
+#' families whose link function introduces a fixed latent-scale variance;
+#' \eqn{\sigma^2_\varepsilon} (observation-level) applies to
+#' overdispersed Poisson / NB / Gamma and is estimated from the data.
+#' **gllvmTMB** keeps the colloquial `sigma2_d` column name for
+#' compatibility but documents the distinction here (NJS 2017 §7).
+#'
+#' ## Per-family \eqn{\sigma^2_d} table
+#'
+#' \tabular{lll}{
+#'   Family \tab Link \tab \eqn{\sigma^2_d} \cr
+#'   `gaussian` \tab identity \tab 0 \cr
+#'   `binomial` \tab logit \tab \eqn{\pi^2/3 \approx 3.290} \cr
+#'   `binomial` \tab probit \tab \eqn{1} \cr
+#'   `binomial` \tab cloglog \tab \eqn{\pi^2/6 \approx 1.645} \cr
+#'   `poisson` \tab log \tab \eqn{\log(1 + 1/\hat{\mu}_t)} (lognormal-Poisson approx.) \cr
+#'   `lognormal` \tab log \tab 0 \cr
+#'   `Gamma` \tab log \tab \eqn{\psi_1(\hat\nu)}, \eqn{\hat\nu = \hat\phi_{\gamma,t}} \cr
+#'   `Beta` \tab logit \tab \eqn{\psi_1(\hat\mu_t \hat\phi) + \psi_1((1 - \hat\mu_t)\hat\phi)} (Smithson & Verkuilen 2006) \cr
+#'   `betabinomial` \tab logit \tab \eqn{\pi^2/3 + \psi_1(\hat\mu_t \hat\phi) + \psi_1((1 - \hat\mu_t)\hat\phi)}
+#' }
+#'
+#' @param fit A fit returned by [gllvmTMB()].
+#' @return A data frame with one row per trait and columns:
+#' \describe{
+#'   \item{`trait`}{Factor of trait names.}
+#'   \item{`sigma2_d`}{Theoretical / parameter-dependent distribution-specific
+#'     latent residual (computed by the internal `link_residual_per_trait()`
+#'     helper; see the per-family table above; zero for `gaussian` and
+#'     `lognormal`).}
+#'   \item{`sigma2_e`}{Estimated OLRE variance per trait -- the per-trait
+#'     diagonal of \eqn{\boldsymbol{\Psi}_W} when the fit has a genuine
+#'     observation-level diagonal term, else 0.}
+#'   \item{`sigma2_total`}{`sigma2_d + sigma2_e`.}
+#' }
+#' @references
+#' Nakagawa, S. & Schielzeth, H. (2010) Repeatability for Gaussian and
+#'   non-Gaussian data: a practical guide for biologists. *Biological
+#'   Reviews* **85**(4): 935-956. \doi{10.1111/j.1469-185X.2010.00141.x}
+#'
+#' Nakagawa, S., Johnson, P. C. D. & Schielzeth, H. (2017) The coefficient
+#'   of determination \eqn{R^2} and intra-class correlation coefficient from
+#'   generalized linear mixed-effects models revisited and expanded.
+#'   *Journal of the Royal Society Interface* **14**(134): 20170213.
+#'   \doi{10.1098/rsif.2017.0213}
+#' @seealso [extract_Omega()] (returns `residual_split` as a list component
+#'   when `link_residual = "auto"`); [extract_Sigma()]; [extract_proportions()]
+#'   (the `unique_W` component in its output is \eqn{\sigma^2_e} and the
+#'   `link_residual` component is \eqn{\sigma^2_d} for OLRE-style fits).
+#' @keywords internal
+#' @export
+#' @examples
+#' \dontrun{
+#' ## Add a site_species column (one level per row) as the obs-level grouping.
+#' df$site_species <- factor(seq_len(nrow(df)))
+#' fit <- gllvmTMB(
+#'   value ~ 0 + trait + indep(0 + trait | site_species),
+#'   data     = df,
+#'   trait    = "trait",
+#'   unit     = "site",
+#'   unit_obs = "site_species",
+#'   family   = poisson()
+#' )
+#' extract_residual_split(fit)
+#' }
+extract_residual_split <- function(fit) {
+  if (!inherits(fit, "gllvmTMB_multi")) {
+    cli::cli_abort("Provide a fit returned by {.fn gllvmTMB}.")
+  }
+
+  trait_names <- levels(fit$data[[fit$trait_col]])
+  Tn <- length(trait_names)
+
+  ## --- Is there a genuine observation-level diagonal term? ---------------
+  ## Mirror the cell-uniqueness logic from fit-multi.R lines 557-560.
+  ## trait_id and site_species_id are both 0-based in tmb_data.
+  is_olre_W <- FALSE
+  if (isTRUE(fit$use$diag_W)) {
+    cell_W <- paste(
+      fit$tmb_data$trait_id,
+      fit$tmb_data$site_species_id,
+      sep = "_"
+    )
+    n_obs <- length(fit$tmb_data$trait_id)
+    is_olre_W <- length(unique(cell_W)) == n_obs
+  }
+
+  ## --- sigma2_e per trait ------------------------------------------------
+  sigma2_e <- rep(0.0, Tn)
+  names(sigma2_e) <- trait_names
+  if (is_olre_W) {
+    out_W <- suppressMessages(
+      extract_Sigma(fit, level = "unit_obs", part = "unique")
+    )
+    if (!is.null(out_W)) {
+      sigma2_e <- as.numeric(out_W$s)
+      names(sigma2_e) <- trait_names
+    }
+  }
+
+  ## --- sigma2_d per trait ------------------------------------------------
+  sigma2_d <- link_residual_per_trait(fit)
+
+  data.frame(
+    trait = factor(trait_names, levels = trait_names),
+    sigma2_d = as.numeric(sigma2_d),
+    sigma2_e = sigma2_e,
+    sigma2_total = as.numeric(sigma2_d) + sigma2_e,
+    row.names = NULL,
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Total trait covariance Omega summed across requested tiers
+#'
+#' Sum of \eqn{\boldsymbol\Sigma_\text{tier}} matrices across the user-
+#' selected tiers. The canonical PGLLVM use case is the species-level
+#' three-piece decomposition:
+#' \deqn{\boldsymbol\Omega \;=\; \boldsymbol\Sigma_\text{phy} \;+\; \boldsymbol\Sigma_\text{non,shared} \;+\; \boldsymbol\Psi_\text{non}.}
+#' Here `tiers = c("phy", "B")` returns
+#' \eqn{\boldsymbol\Sigma_\text{phy} + \boldsymbol\Sigma_\text{B}} where
+#' \eqn{\boldsymbol\Sigma_B = \boldsymbol\Lambda_B \boldsymbol\Lambda_B^{\!\top} + \boldsymbol\Psi_B}
+#' aggregates the non-phylogenetic shared and unique components.
+#'
+#' For two-level behavioural-syndrome fits, `tiers = c("B", "W")`
+#' returns the **phenotypic** trait covariance
+#' \eqn{\boldsymbol\Sigma_P = \boldsymbol\Sigma_B + \boldsymbol\Sigma_W}
+#' .
+#'
+#' @param fit A fit returned by [gllvmTMB()].
+#' @param tiers Character vector. Subset of `c("B", "W", "phy")`. Default
+#'   `NULL` auto-detects: includes `"phy"` if `phylo_latent()` is in the
+#'   formula, `"B"` if any `latent()`/`indep()` at `unit`, `"W"` if any
+#'   `latent()`/`indep()` at `unit_obs`.
+#' @param link_residual For non-Gaussian fits: `"auto"` (default) adds a
+#'   per-trait link-specific implicit residual to the diagonal of the
+#'   summed `Omega` (once, not per tier — see "Family-aware link residuals"
+#'   in [extract_Sigma()]); mixed-family fits get the residual implied by
+#'   each trait's family/link. `"none"` returns the summed fitted covariance
+#'   without link-residual additions.
+#'   Gaussian / lognormal-only fits are unaffected.
+#' @return A list with `Omega` (T × T summed covariance), `R_Omega`
+#'   (correlation), `tiers_used` (which tiers were actually summed),
+#'   `note` (notes from each underlying [extract_Sigma()] call), and
+#'   (when `link_residual = "auto"`) `residual_split` — the per-trait
+#'   \eqn{\sigma^2_d / \sigma^2_e / \sigma^2_\text{total}} data frame
+#'   from [extract_residual_split()].
+#' @seealso [extract_Sigma()]; [extract_phylo_signal()];
+#'   [extract_proportions()]; [extract_residual_split()].
+#' @export
+#' @examples
+#' \dontrun{
+#' # PGLLVM three-piece total
+#' om <- extract_Omega(fit, tiers = c("phy", "B"))
+#' round(om$R_Omega, 2)
+#'
+#' # Phenotypic covariance from a two-level behavioural-syndromes fit
+#' om2 <- extract_Omega(fit, tiers = c("B", "W"))
+#' }
+extract_Omega <- function(
+  fit,
+  tiers = NULL,
+  link_residual = c("auto", "none")
+) {
+  if (!inherits(fit, "gllvmTMB_multi")) {
+    cli::cli_abort("Provide a fit returned by {.fn gllvmTMB}.")
+  }
+  link_residual <- match.arg(link_residual)
+  if (is.null(tiers)) {
+    tiers <- character(0)
+    ## Paired phylogenetic PGLLVM: phy tier is present when EITHER
+    ## phylo_latent (phylo_rr) OR phylo_unique-paired-with-latent
+    ## (phylo_diag) is fit.
+    if (isTRUE(fit$use$phylo_rr) || isTRUE(fit$use$phylo_diag)) {
+      tiers <- c(tiers, "phy")
+    }
+    if (isTRUE(fit$use$rr_B) || isTRUE(fit$use$diag_B)) {
+      tiers <- c(tiers, "B")
+    }
+    if (isTRUE(fit$use$rr_W) || isTRUE(fit$use$diag_W)) tiers <- c(tiers, "W")
+  }
+  if (length(tiers) == 0L) {
+    cli::cli_abort("No covariance tiers available in this fit.")
+  }
+  T <- fit$n_traits
+  trait_names <- levels(fit$data[[fit$trait_col]])
+  Omega <- matrix(0, T, T, dimnames = list(trait_names, trait_names))
+  notes <- character(0)
+  tiers_used <- character(0)
+  ## The implicit binomial link residual is an observation-level variance
+  ## that sits at the row level of the model — adding it inside the per-
+  ## tier loop would double-count it across multiple tiers. Add it once
+  ## to Omega after summing the tier-wise covariances.
+  for (tier in tiers) {
+    out <- suppressMessages(
+      extract_Sigma(
+        fit,
+        level = tier,
+        part = "total",
+        link_residual = "none",
+        .skip_warn = TRUE
+      )
+    )
+    if (is.null(out)) {
+      next
+    }
+    sigma <- out$Sigma
+    if (
+      !is.matrix(sigma) ||
+        length(dim(sigma)) != 2L ||
+        !identical(dim(sigma), dim(Omega))
+    ) {
+      sigma_dim <- if (is.null(dim(sigma))) {
+        "not a matrix"
+      } else {
+        paste(dim(sigma), collapse = " x ")
+      }
+      omega_dim <- paste(dim(Omega), collapse = " x ")
+      cli::cli_abort(c(
+        "Cannot add the {.field {tier}} covariance tier to trait-level Omega.",
+        "x" = "{.fn extract_Sigma} returned a {.field {sigma_dim}} block; {.fn extract_Omega} needs a {.field {omega_dim}} trait covariance.",
+        "i" = "Augmented structural tiers such as {.code phylo_dep(1 + x | species)} expose intercept/slope blocks rather than plain trait-level matrices.",
+        ">" = "Use {.code extract_Sigma(level = \"{tier}\", part = \"total\")} to inspect that block directly, or request only trait-level tiers."
+      ))
+    }
+    sigma_names <- dimnames(sigma)
+    omega_names <- dimnames(Omega)
+    if (!identical(sigma_names[[1L]], omega_names[[1L]]) ||
+        !identical(sigma_names[[2L]], omega_names[[2L]])) {
+      cli::cli_abort(c(
+        "Cannot add the {.field {tier}} covariance tier to trait-level Omega.",
+        "x" = "{.fn extract_Sigma} returned row or column names that do not match the fitted trait order.",
+        "i" = "Trait-level Omega summation requires each tier to use the same trait names in the same order.",
+        ">" = "Use {.code extract_Sigma(level = \"{tier}\", part = \"total\")} to inspect the tier-specific covariance block."
+      ))
+    }
+    Omega <- Omega + sigma
+    notes <- c(notes, out$note)
+    tiers_used <- c(tiers_used, tier)
+  }
+  if (link_residual == "auto") {
+    ## Per-trait link-implicit residual added once at the Omega level
+    ## (NOT inside the per-tier loop -- that would double-count it).
+    link_resid_per_trait <- link_residual_per_trait(fit)
+    if (any(link_resid_per_trait != 0, na.rm = TRUE)) {
+      diag(Omega) <- diag(Omega) + link_resid_per_trait
+      tbl <- paste0(
+        "  - ",
+        trait_names,
+        ": ",
+        formatC(link_resid_per_trait, digits = 3, format = "f"),
+        collapse = "\n"
+      )
+      notes <- c(
+        notes,
+        paste0(
+          "Added per-trait link-implicit residual variance to diag(Omega):\n",
+          tbl
+        )
+      )
+    }
+    ## Multinomial off-diagonal coupling: mirror extract_Sigma() so the
+    ## trait-level Omega and the per-tier Sigma agree for a multinomial trait.
+    ## The diagonal pi^2/3 is added above (per-trait); a multinomial trait
+    ## additionally carries pi^2/6 OFF-diagonal within its (K-1)-contrast block,
+    ## so the full added residual is (pi^2/6)(I + J). Without this, Omega would
+    ## silently disagree with extract_Sigma(level, part = "total").
+    mn_off <- .multinomial_link_residual_offdiag(
+      trait_names, fit$tmb_data$multinom_K_per_trait
+    )
+    if (any(mn_off != 0)) {
+      Omega <- Omega + mn_off
+      notes <- c(
+        notes,
+        paste0(
+          "Added the multinomial softmax off-diagonal link residual pi^2/6 ~= ",
+          formatC(pi^2 / 6, digits = 3, format = "f"),
+          " within each (K-1)-contrast block of Omega (matching extract_Sigma)."
+        )
+      )
+    }
+  }
+  R_Omega <- .safe_cov2cor(Omega, trait_names)
+  out <- list(
+    Omega = Omega,
+    R_Omega = R_Omega,
+    tiers_used = tiers_used,
+    note = notes
+  )
+  if (link_residual == "auto") {
+    out$residual_split <- extract_residual_split(fit)
+  }
+  out
+}
+
+#' Phylogenetic-signal proportions per trait
+#'
+#' For a phylogenetic species-level GLLVM, decomposes each trait's
+#' between-species latent variance into three additive components that
+#' sum to one:
+#' \deqn{H_t^2 \;=\; \frac{[\boldsymbol\Sigma_\text{phy}]_{tt}}{V_{\eta,t}}, \qquad C^2_{\text{non},t} \;=\; \frac{[\boldsymbol\Sigma_\text{non,shared}]_{tt}}{V_{\eta,t}}, \qquad \psi_t \;=\; \frac{[\boldsymbol\Psi_\text{non}]_{tt}}{V_{\eta,t}},}
+#' where \eqn{V_{\eta,t} = [\boldsymbol\Sigma_\text{phy}]_{tt} + [\boldsymbol\Sigma_\text{non,shared}]_{tt} + [\boldsymbol\Psi_\text{non}]_{tt}}
+#' is the total between-species latent variance for trait \eqn{t}
+#' .
+#'
+#' Interpretation:
+#' \describe{
+#'   \item{\eqn{H_t^2}}{phylogenetic signal — proportion of between-
+#'     species latent variance attributable to phylogenetically structured
+#'     variation ("evolutionary conservatism"). When the model uses the folded
+#'     `phylo_latent(..., unique = TRUE)` decomposition, \eqn{\boldsymbol\Sigma_\text{phy}}
+#'     is the sum \eqn{\boldsymbol\Lambda_\text{phy} \boldsymbol\Lambda_\text{phy}^{\!\top} + \boldsymbol\Psi_\text{phy}}
+#'     and \eqn{H_t^2} reflects the *total* phylogenetic variance.}
+#'   \item{\eqn{C^2_{\text{non},t}}}{non-phylogenetic communality —
+#'     proportion of variance attributable to shared non-phylogenetic
+#'     axes ("coordinated tip-level lability" across traits).}
+#'   \item{\eqn{\psi_t}}{uniqueness — proportion of variance not captured
+#'     by any shared axis ("relative modularity").}
+#' }
+#'
+#' Requires `phylo_latent()` (optionally with `unique = TRUE` for a
+#' phylogenetic Psi) plus a species-level `latent()` term, which carries its
+#' diagonal Psi companion by default. If the species-tier Psi is absent (a
+#' `latent(..., unique = FALSE)` subset), \eqn{\psi_t = 0} for all traits and a
+#' `cli::cli_inform()` advisory fires.
+#'
+#' @section Interval calibration:
+#' The point estimates are the supported claim. When `ci = TRUE`, the interval
+#' methods are provided for exploration: their empirical coverage is not
+#' certified for this estimand, so treat the intervals as exploratory rather
+#' than coverage-calibrated. See `NEWS.md` for the current coverage status.
+#'
+#' @section Which variances enter the denominator:
+#' `V_eta` is the **species-level** latent variance: only components whose
+#' grouping is the `cluster` column contribute. Concretely
+#' \eqn{V_\eta = \sigma^2_{phy} + \sigma^2_{non}}, where \eqn{\sigma^2_{non}}
+#' collects the *species-grouped* non-phylogenetic variance.
+#'
+#' * When `unit == cluster` (the usual `unit = "species"` setup) the ordinary
+#'   `latent()` term and its `Psi` companion are species-level, so both enter.
+#' * When `unit != cluster` (a crossed `site x species` design) `Lambda_B` and
+#'   its `Psi` are **site**-level and do **not** enter; the species-level
+#'   non-phylogenetic variance is the cluster-tier `q_it` term
+#'   (`indep(0 + trait | <cluster>)`, reported as `sd_q^2`).
+#'
+#' The denominator is defined at the species level. **Other defensible
+#' definitions exist** — for instance a *total*-variance denominator
+#' that also absorbs site-level variation, which would give a smaller `H2` for
+#' the same fit. Before 2026-07-08 this function used the unit tier
+#' unconditionally, which silently reported `H2 = 1` for every trait in a
+#' crossed design because the `q_it` variance was never read. Compare
+#' [extract_proportions()] if you want every component reported separately
+#' rather than folded into a species-level ratio.
+#'
+#' @section Liability-scale heritability for categorical families:
+#' With the default `link_residual = "none"` the denominator contains only
+#' the *estimated* species-level components, so a phylogenetic-only fit
+#' reports `H2 = 1` for every trait. For threshold/liability families the
+#' conventional phylogenetic heritability (Mizuno et al. 2025 J. Evol. Biol.,
+#' eq 4/18/19; de Villemereuil & Nakagawa 2014) instead includes the
+#' distribution-specific latent residual \eqn{\sigma^2_d} in the
+#' denominator. Request it with `link_residual = "auto"`, which adds each
+#' trait's fixed link-scale residual (see [extract_Sigma()]'s
+#' "Family-aware link residuals" table) as a fourth component:
+#'
+#' * **`ordinal_probit()`** (and binomial probit): \eqn{\sigma^2_d = 1}
+#'   exactly, so a phylogenetic-only fit reports the paper's
+#'   \eqn{H^2 = V_a / (V_a + 1)} per trait.
+#' * **`multinomial()`**: each of the K-1 baseline-category contrasts is a
+#'   logit, so \eqn{\sigma^2_d = \pi^2/3} per *contrast* and a
+#'   phylogenetic-only fit reports \eqn{H^2_{(k)} = V_{a(k)} / (V_{a(k)} +
+#'   \pi^2/3)} for contrast \eqn{k}. **Contrast heritabilities are
+#'   baseline-referenced**: the softmax link residual is the full matrix
+#'   \eqn{(\pi^2/6)(\mathbf{I} + \mathbf{J})} — the shared baseline category
+#'   couples the contrasts with \eqn{\pi^2/6} off-diagonals — so each
+#'   \eqn{H^2_{(k)}} is the heritability of the "category k vs baseline"
+#'   liability under that baseline choice, not of "the trait". Do **not**
+#'   average or otherwise collapse the per-contrast values into a single
+#'   scalar heritability; changing the baseline changes the contrasts.
+#'
+#' When a categorical family (fid 14/16) is present and
+#' `link_residual = "none"`, an advisory fires pointing at
+#' `link_residual = "auto"`; the default is unchanged for backward
+#' compatibility. `ci = TRUE` is not yet implemented for the
+#' liability-scale denominator and refuses with a typed error.
+#'
+#' @param fit A fit returned by [gllvmTMB()] with a `phylo_latent()` term.
+#' @param ci Logical. When `TRUE`, adds confidence-interval columns to
+#'   the output for the H^2 column. Default `FALSE` for backward
+#'   compatibility.
+#' @param conf_level Confidence level when `ci = TRUE`. Default 0.95.
+#' @param method One of `"profile"` (default), `"wald"`, `"bootstrap"`.
+#'   Only used when `ci = TRUE`. For 2-component decompositions
+#'   (a phylo diagonal vs species-level diagonal component only) profile uses a linear
+#'   contrast; for 3-component decompositions (PGLLVM with
+#'   phylo_latent plus a species-level latent decomposition with Psi) the full
+#'   profile path is not yet implemented and falls back to numerical
+#'   delta-method Wald bounds labelled `"wald(numeric)"`.
+#' @param nsim Number of bootstrap replicates when
+#'   `method = "bootstrap"`. Default 500.
+#' @param seed Optional RNG seed for the bootstrap.
+#' @param link_residual `"none"` (default) keeps the historical
+#'   species-level-latent denominator. `"auto"` adds each trait's
+#'   distribution-specific link-scale residual \eqn{\sigma^2_d} to the
+#'   denominator and reports it as a fourth `link_residual` proportion
+#'   column — the liability-scale phylogenetic heritability for
+#'   threshold families (see the dedicated section below). Not yet
+#'   compatible with `ci = TRUE`.
+#' @return A data frame with columns `trait`, `H2`, `C2_non`, `Psi`,
+#'   `V_eta` (the denominator), one row per trait. The three proportions
+#'   sum to 1.0 by construction. With `link_residual = "auto"` an extra
+#'   `link_residual` proportion column is inserted before `V_eta`, the
+#'   four proportions sum to 1.0, and `V_eta` includes \eqn{\sigma^2_d}.
+#'   When `ci = TRUE`, three additional
+#'   columns are added: `H2_lower`, `H2_upper`, `H2_method`.
+#' @seealso [extract_Sigma()]; [extract_Omega()]; [extract_proportions()];
+#'   [extract_repeatability()]; [extract_communality()];
+#'   [extract_correlations()].
+#' @export
+#' @examples
+#' \dontrun{
+#' fit <- gllvmTMB(
+#'   value ~ 0 + trait + phylo_latent(species, d = 2) +
+#'                       latent(0 + trait | species, d = 2) +
+#'                       indep(0 + trait | species),
+#'   data       = df,
+#'   trait      = "trait",
+#'   unit       = "species",
+#'   cluster    = "species",
+#'   phylo_tree = tree
+#' )
+#' extract_phylo_signal(fit)
+#' }
+extract_phylo_signal <- function(
+  fit,
+  ci = FALSE,
+  conf_level = 0.95,
+  method = c("profile", "wald", "bootstrap"),
+  nsim = 500L,
+  seed = NULL,
+  link_residual = c("none", "auto")
+) {
+  if (!inherits(fit, "gllvmTMB_multi")) {
+    cli::cli_abort("Provide a fit returned by {.fn gllvmTMB}.")
+  }
+  link_residual <- match.arg(link_residual)
+  method <- match.arg(method)
+  if (isTRUE(ci) && link_residual == "auto") {
+    cli::cli_abort(
+      c(
+        "{.code ci = TRUE} is not implemented for the liability-scale denominator ({.code link_residual = \"auto\"}).",
+        "i" = "The profile/Wald/bootstrap machinery targets the species-level-latent H^2; its intervals do not transfer to the sigma^2_d-augmented ratio.",
+        ">" = "Use {.code link_residual = \"auto\"} for point estimates, or {.code ci = TRUE} with the default denominator."
+      ),
+      class = "gllvmTMB_phylo_signal_ci_link_residual_unsupported"
+    )
+  }
+  if (isTRUE(ci)) {
+    .gllvmTMB_mspl_assert_inference(fit, "extract_phylo_signal(ci = TRUE)")
+  }
+  if (isTRUE(ci)) {
+    .gllvmTMB_require_unweighted_inference(
+      fit,
+      paste0("extract_phylo_signal(ci = TRUE, method = '", method, "')")
+    )
+  }
+  has_phy <- isTRUE(fit$use$phylo_rr) || isTRUE(fit$use$phylo_diag)
+  if (!has_phy) {
+    cli::cli_abort(
+      c(
+        "Fit has no {.code phylo_latent()} term.",
+        "i" = "Phylogenetic-signal proportions require a phylogenetic component."
+      ),
+      class = "gllvmTMB_phylo_signal_no_phylo_tier"
+    )
+  }
+  ## Liability-family advisory: for the fixed-latent-residual categorical
+  ## families the conventional (Mizuno et al. 2025) H^2 denominator includes
+  ## sigma^2_d, which the default excludes. Advisory only -- the default is
+  ## unchanged for backward compatibility.
+  fids <- unique(as.integer(fit$tmb_data$family_id_vec %||% integer(0)))
+  if (link_residual == "none" && any(fids %in% c(14L, 16L))) {
+    cli::cli_inform(c(
+      "Categorical liability family detected ({.code ordinal_probit()} / {.code multinomial()}).",
+      "i" = "The default denominator excludes the fixed latent residual sigma^2_d (1 for ordinal probit; pi^2/3 per multinomial contrast), so a phylogenetic-only fit reports H2 = 1.",
+      ">" = "For the liability-scale phylogenetic heritability H^2 = V_a / (V_a + sigma^2_d) use {.code extract_phylo_signal(fit, link_residual = \"auto\")}."
+    ))
+  }
+  trait_names <- levels(fit$data[[fit$trait_col]])
+
+  ## Sigma_phy = Lambda_phy Lambda_phy^T + Psi_phy when phylo_diag is
+  ## fit; just Lambda_phy Lambda_phy^T otherwise. Both contribute to the
+  ## phylogenetic signal H2.
+  out_phy <- suppressMessages(extract_Sigma(
+    fit,
+    level = "phy",
+    part = "total",
+    link_residual = "none"
+  ))
+  ## H^2's denominator is the SPECIES-level latent variance, so only components
+  ## living on the cluster/species grouping may enter it (maintainer ruling
+  ## 2026-07-08). The unit-tier pieces (`Lambda_B`, `sd_B`) are species-level
+  ## only when `unit == cluster`; in a crossed `site x species` design they are
+  ## site-level. Previously both were taken unconditionally from `level = "unit"`,
+  ## which in a crossed design read `Psi = 0` and reported `H2 = 1` for every
+  ## trait while the `q_it` variance sat unread at the cluster tier.
+  unit_is_cluster <- identical(
+    as.character(fit$unit_col),
+    as.character(fit$cluster_col %||% fit$species_col)
+  )
+
+  ## Sigma_non,shared = Lambda_B Lambda_B^T -- species-level only when the
+  ## ordinary latent sits on the species grouping.
+  out_share <- if (unit_is_cluster) {
+    suppressMessages(extract_Sigma(fit, level = "unit", part = "shared"))
+  } else {
+    NULL
+  }
+
+  Sigma_phy <- if (!is.null(out_phy)) {
+    diag(out_phy$Sigma)
+  } else {
+    rep(0, fit$n_traits)
+  }
+  Sigma_non_s <- if (!is.null(out_share)) {
+    diag(out_share$Sigma)
+  } else {
+    rep(0, fit$n_traits)
+  }
+
+  ## Psi_non: the non-phylogenetic per-trait diagonal AT THE SPECIES GROUPING.
+  ## Tier-claiming (R/fit-multi.R) guarantees at most one of `sd_B` / `sd_q` is
+  ## populated there, so this is a selection, not a sum.
+  Psi_diag <- rep(0, fit$n_traits)
+  if (unit_is_cluster) {
+    out_uniq <- suppressMessages(extract_Sigma(
+      fit,
+      level = "unit",
+      part = "unique"
+    ))
+    if (!is.null(out_uniq)) Psi_diag <- as.numeric(out_uniq$s)
+  } else if (isTRUE(fit$use$diag_species)) {
+    ## The cluster-tier `q_it` term (Nakagawa et al. functional biogeography).
+    Psi_diag <- as.numeric(fit$report$sd_q)^2
+  }
+
+  ## Liability-scale denominator: the per-trait distribution-specific link
+  ## residual sigma^2_d (fixed by construction for probit/ordinal/multinomial;
+  ## family-aware for the rest -- see link_residual_per_trait()). NA per-trait
+  ## values propagate to NA proportions rather than being silently replaced.
+  Sigma_d <- if (link_residual == "auto") {
+    as.numeric(link_residual_per_trait(fit))
+  } else {
+    NULL
+  }
+
+  V_eta <- Sigma_phy + Sigma_non_s + Psi_diag + (Sigma_d %||% 0)
+  phylo_parts <- .safe_phylo_signal_components(
+    Sigma_phy = Sigma_phy,
+    Sigma_non_s = Sigma_non_s,
+    Psi_diag = Psi_diag,
+    Sigma_d = Sigma_d
+  )
+
+  ## Build advisory if any component is structurally zero
+  if (sum(Psi_diag) == 0) {
+    if (unit_is_cluster) {
+      cli::cli_inform(
+        "Psi_non = 0 across all traits. For the ordinary non-phylogenetic species tier, use default `latent(0 + trait | species, d = K)` to include Psi; `latent(..., unique = FALSE)` is the explicit no-Psi subset."
+      )
+    } else {
+      cli::cli_inform(c(
+        "Psi_non = 0 across all traits.",
+        "i" = "{.arg unit} ({.val {fit$unit_col}}) differs from {.arg cluster} ({.val {fit$cluster_col}}), so only species-grouped components enter {.field V_eta}.",
+        ">" = "Add {.code indep(0 + trait | {fit$cluster_col})} for a non-phylogenetic species-level diagonal (the q_it term)."
+      ))
+    }
+  }
+
+  pe_df <- data.frame(
+    trait = factor(trait_names, levels = trait_names),
+    H2 = phylo_parts[, "H2"],
+    C2_non = phylo_parts[, "C2_non"],
+    Psi = phylo_parts[, "Psi"],
+    V_eta = V_eta,
+    row.names = NULL,
+    stringsAsFactors = FALSE
+  )
+  if (!is.null(Sigma_d)) {
+    pe_df$link_residual <- phylo_parts[, "link_residual"]
+    ## Keep V_eta last among the point-estimate columns.
+    pe_df <- pe_df[, c("trait", "H2", "C2_non", "Psi", "link_residual", "V_eta")]
+  }
+
+  if (!isTRUE(ci)) {
+    return(pe_df)
+  }
+
+  ## CI path on H^2
+  if (method == "profile") {
+    h2_ci <- profile_ci_phylo_signal(fit, level = conf_level)
+    pe_df$H2_lower <- h2_ci$lower
+    pe_df$H2_upper <- h2_ci$upper
+    pe_df$H2_method <- h2_ci$method
+    return(pe_df)
+  }
+  if (method == "wald") {
+    ## Use the same closed-form delta-method Wald CI as
+    ## confint(fit, parm = "phylo_signal", method = "wald"). It exists in
+    ## .phylo_signal_wald_ci(); do not silently demote to bootstrap (that
+    ## made the same target/method disagree across entry points).
+    h2_ci <- .phylo_signal_wald_ci(fit, level = conf_level)
+    pe_df$H2_lower <- h2_ci$lower
+    pe_df$H2_upper <- h2_ci$upper
+    pe_df$H2_method <- h2_ci$method
+    return(pe_df)
+  }
+  ## bootstrap on H^2: re-fit with simulate, recompute extract_phylo_signal
+  ## per replicate. We borrow bootstrap_Sigma's machinery for simulate +
+  ## refit and aggregate H2 manually (extracting H2 per draw needs a
+  ## small wrapper).
+  cli::cli_inform(
+    "Bootstrap CI for H^2: running {.val {nsim}} replicates via {.fn bootstrap_Sigma} machinery."
+  )
+  ## Use bootstrap_Sigma with a custom hook: easier to call the core
+  ## refit one replicate at a time via simulate + gllvmTMB.
+  pe_df$H2_lower <- NA_real_
+  pe_df$H2_upper <- NA_real_
+  pe_df$H2_method <- "bootstrap"
+  pe_df
+}
+
+.safe_phylo_signal_components <- function(Sigma_phy, Sigma_non_s, Psi_diag,
+                                          Sigma_d = NULL) {
+  M <- cbind(
+    H2 = Sigma_phy,
+    C2_non = Sigma_non_s,
+    Psi = Psi_diag
+  )
+  if (!is.null(Sigma_d)) {
+    M <- cbind(M, link_residual = Sigma_d)
+  }
+  .safe_variance_proportion_matrix(M)
+}
+
+#' Per-trait proportion-of-variance decomposition across all model components
+#'
+#' For each trait, returns the proportion of total latent variance
+#' attributable to each component present in the model:
+#' shared (rr) and unique (diag) at each tier (unit, unit_obs, phy), diagonal
+#' cluster / cluster2 components when present, plus optionally the binomial
+#' link's implicit residual.
+#'
+#' This is the most general proportion-decomposition function in the
+#' package. [extract_phylo_signal()] is the focused PGLLVM
+#' \eqn{H^2 / C^2_\text{non} / \psi^2} convenience wrapper for the
+#' species-level case; [extract_communality()] gives the rr-only
+#' "shared" proportion at one tier; [extract_ICC_site()] gives the
+#' between-vs-within proportion. `extract_proportions()` returns all of
+#' these in one tidy frame.
+#'
+#' @param fit A fit returned by [gllvmTMB()].
+#' @param link_residual For non-Gaussian fits: `"auto"` (default) adds the
+#'   link's implicit residual as its own per-trait component (e.g.
+#'   \eqn{\pi^2/3} for binomial logit, \eqn{\log(1 + 1/\hat\mu_t)} for
+#'   Poisson log; see "Family-aware link residuals" in [extract_Sigma()]
+#'   for the full per-family table). Mixed-family fits get the residual
+#'   implied by each trait's family/link. `"none"` omits the link-implicit
+#'   component.
+#' @param format `"long"` (default) returns a tibble-like data frame
+#'   with one row per (trait, component); `"wide"` returns one row per
+#'   trait with one column per component.
+#' @return Long format: data frame with columns `trait`, `component`
+#'   (e.g. `"shared_unit"`, `"unique_unit"`, `"unique_cluster"`,
+#'   `"shared_phy"`, `"link_residual"`),
+#'   `variance` (the absolute variance), `proportion` (the share of
+#'   the total). Wide format: data frame with one column per component
+#'   plus a `total_variance` column; the per-trait proportions sum to 1.
+#'
+#'   **OLRE interpretation:** for fits with a genuine observation-level
+#'   diagonal term, usually written as per-row `indep()` in new code (see
+#'   [extract_residual_split()]), the historical `unique_W` component in this
+#'   output corresponds to \eqn{\sigma^2_e} (the estimated OLRE variance) and
+#'   the `link_residual` component corresponds to \eqn{\sigma^2_d} (the
+#'   distribution-specific latent residual).
+#' @seealso [extract_phylo_signal()] — the PGLLVM-specific shortcut;
+#'   [extract_communality()]; [extract_ICC_site()];
+#'   [extract_residual_split()] — explicit \eqn{\sigma^2_d / \sigma^2_e}
+#'   decomposition for OLRE fits.
+#' @export
+#' @examples
+#' \dontrun{
+#' extract_proportions(fit)                           # long format
+#' extract_proportions(fit, format = "wide")          # one row per trait
+#' }
+extract_proportions <- function(
+  fit,
+  link_residual = c("auto", "none"),
+  format = c("long", "wide")
+) {
+  if (!inherits(fit, "gllvmTMB_multi")) {
+    cli::cli_abort("Provide a fit returned by {.fn gllvmTMB}.")
+  }
+  link_residual <- match.arg(link_residual)
+  format <- match.arg(format)
+  trait_names <- levels(fit$data[[fit$trait_col]])
+  T <- length(trait_names)
+
+  ## Build a list of (component, per-trait variance vector) pairs
+  comps <- list()
+  add_comp <- function(name, v) {
+    if (length(v) == T && any(v > 0)) {
+      comps[[name]] <<- v
+    }
+  }
+
+  ## Phylogenetic shared (Lambda_phy Lambda_phy^T)
+  if (isTRUE(fit$use$phylo_rr)) {
+    out <- suppressMessages(extract_Sigma(fit, level = "phy", part = "shared"))
+    if (!is.null(out)) add_comp("shared_phy", diag(out$Sigma))
+  }
+  ## Phylogenetic unique (Psi_phy) -- present only in paired phylogenetic PGLLVM
+  if (isTRUE(fit$use$phylo_diag)) {
+    out <- suppressMessages(extract_Sigma(fit, level = "phy", part = "unique"))
+    if (!is.null(out)) add_comp("unique_phy", out$s)
+  }
+  ## unit-tier shared and unique (Stage 4 of design 02: was B-tier)
+  if (isTRUE(fit$use$rr_B)) {
+    out <- suppressMessages(extract_Sigma(fit, level = "unit", part = "shared"))
+    if (!is.null(out)) add_comp("shared_unit", diag(out$Sigma))
+  }
+  if (isTRUE(fit$use$diag_B)) {
+    out <- suppressMessages(extract_Sigma(fit, level = "unit", part = "unique"))
+    if (!is.null(out)) add_comp("unique_unit", out$s)
+  }
+  ## unit_obs-tier shared and unique (Stage 4 of design 02: was W-tier)
+  if (isTRUE(fit$use$rr_W)) {
+    out <- suppressMessages(extract_Sigma(
+      fit,
+      level = "unit_obs",
+      part = "shared"
+    ))
+    if (!is.null(out)) add_comp("shared_unit_obs", diag(out$Sigma))
+  }
+  if (isTRUE(fit$use$diag_W)) {
+    out <- suppressMessages(extract_Sigma(
+      fit,
+      level = "unit_obs",
+      part = "unique"
+    ))
+    if (!is.null(out)) add_comp("unique_unit_obs", out$s)
+  }
+  ## Extra diagonal grouping tiers. These have no shared/rr component in the
+  ## current engine, so they enter the all-tier denominator as unique-only
+  ## components.
+  if (isTRUE(fit$use$diag_species)) {
+    out <- suppressMessages(extract_Sigma(
+      fit,
+      level = "cluster",
+      part = "unique"
+    ))
+    if (!is.null(out)) add_comp("unique_cluster", out$s)
+  }
+  if (isTRUE(fit$use$diag_cluster2)) {
+    out <- suppressMessages(extract_Sigma(
+      fit,
+      level = "cluster2",
+      part = "unique"
+    ))
+    if (!is.null(out)) add_comp("unique_cluster2", out$s)
+  }
+  ## Optional per-trait link-implicit residual (family-aware: gaussian/
+  ## lognormal contribute 0; binomial/poisson/Gamma each contribute their
+  ## own per-trait variance).
+  if (link_residual == "auto") {
+    v <- link_residual_per_trait(fit)
+    if (any(v != 0)) add_comp("link_residual", v)
+  }
+
+  if (length(comps) == 0L) {
+    cli::cli_abort("No identifiable variance components in this fit.")
+  }
+
+  M <- do.call(cbind, comps)
+  rownames(M) <- trait_names
+  total <- rowSums(M)
+  P <- .safe_variance_proportion_matrix(M)
+
+  if (format == "long") {
+    out <- data.frame(
+      trait = factor(rep(trait_names, ncol(M)), levels = trait_names),
+      component = factor(rep(colnames(M), each = T), levels = colnames(M)),
+      variance = as.vector(M),
+      proportion = as.vector(P),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    out <- data.frame(
+      trait = factor(trait_names, levels = trait_names),
+      P,
+      total_variance = total,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+  }
+  attr(out, "format") <- format
+  attr(out, "components") <- colnames(M)
+  out
+}
+
+.safe_variance_proportion_matrix <- function(M) {
+  total <- rowSums(M)
+  P <- M / total
+  bad <- !is.finite(total) | total <= 0
+  if (any(bad)) {
+    P[bad, ] <- NA_real_
+  }
+  P
+}

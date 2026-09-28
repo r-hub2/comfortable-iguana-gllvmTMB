@@ -1,0 +1,464 @@
+---
+title: "Get started with gllvmTMB"
+description: "Fit the smallest Gaussian multivariate model, inspect numerical health, and read covariance before moving to a specialist guide."
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+vignette: >
+  %\VignetteIndexEntry{Get started with gllvmTMB}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  fig.path = "",
+  fig.width = 6, fig.height = 4,
+  fig.align = "center",
+  message = FALSE, warning = FALSE
+)
+```
+
+`gllvmTMB` fits multivariate models for data where each site,
+individual, species, or study has several responses. The first
+question is usually not mathematical:
+
+> Which responses vary together, and how much variation is shared
+> rather than response-specific?
+
+This page does one small, reproducible example. It loads a prepared
+morphometrics object, fits the model from a wide trait table first,
+checks the equivalent long-data call, and extracts the covariance,
+correlation, communality, and ordination summaries a reader normally
+wants first.
+
+`gllvmTMB` has an experimental lifecycle: the formula grammar,
+defaults, and reported summaries and intervals may still change as
+the API matures.
+
+The online guide follows the development branch and may describe features
+absent from this 0.7.1 release. Use this installed vignette and package help
+for the matching release syntax. Before choosing a family, covariance source,
+estimator, or interval method,
+read [Current limitations and boundaries](https://itchyshin.github.io/gllvmTMB/articles/current-limits.html). That
+page distinguishes narrow tested-regime evidence from experimental or partial
+routes and states what each result can and cannot support. The Gaussian latent
+model below is retained as a teaching example for the covariance decomposition
+and rotation-invariant summaries. Use this fit to learn the decomposition and
+interpret covariance point estimates. For a first point estimate in the narrow
+tested Gaussian setting, start with `indep()` or `dep()` and check fit health.
+The example does not certify general interval coverage.
+
+The fitted Gaussian model starts with observations, not with the
+covariance matrix. For each individual and trait, the teaching model is:
+
+$$
+\begin{aligned}
+y_{it}
+&=
+\alpha_t + \boldsymbol{\lambda}_t^{\mathsf T}\mathbf{u}_i + e_{it},\\
+\mathbf{u}_i
+&\sim \mathcal{N}(\mathbf{0}, \mathbf{I}_d),\\
+e_{it}
+&\sim \mathcal{N}(0, \psi_t).
+\end{aligned}
+$$
+
+Here $y_{it}$ is the observed value for individual $i$ and trait $t$.
+The intercept $\alpha_t$ is the average for trait $t$. The vector
+$\mathbf{u}_i$ is the individual's latent score: where that individual
+sits on the unobserved trait axes. The row vector
+$\boldsymbol{\lambda}_t$ says how strongly trait $t$ responds to those
+axes. The leftover term $e_{it}$ is the part of trait $t$ not shared
+with the other traits.
+
+In generalized models, $\eta_{it}$ is the linear predictor and the link
+function $g()$ connects it to the mean response:
+$g(\mu_{it}) = \eta_{it}$. This first example uses a Gaussian family
+with the identity link, so the linear predictor is the mean itself.
+
+The R formula for that model is compact:
+
+```{r first-model-sketch, eval = FALSE}
+fit <- gllvmTMB(
+  traits(length, mass, wing, tarsus, bill) ~ 1 +
+    latent(1 | individual, d = 2),
+  data = df_wide,
+  unit = "individual",
+  family = gaussian()
+)
+```
+
+After fitting, the covariance among traits is the first report-ready
+summary implied by the latent part of the model:
+
+$$
+\begin{aligned}
+\operatorname{Cov}(\mathbf{y}_i)
+&=
+\boldsymbol{\Sigma},\\
+\boldsymbol{\Sigma}
+&=
+\boldsymbol{\Lambda}\boldsymbol{\Lambda}^{\mathsf T}
++
+\boldsymbol{\Psi},\\
+\boldsymbol{\Psi}
+&=
+\operatorname{diag}(\psi_1,\ldots,\psi_T).
+\end{aligned}
+$$
+
+In words: total trait covariance = shared multivariate structure +
+response-specific variation. `Lambda` collects the trait loadings: one
+row per trait and one column per latent variable. The product
+`Lambda Lambda^T` is the shared covariance created by those axes. `Psi`
+is the diagonal matrix of trait-specific variance left over after the
+shared axes. Ordinary `latent()` estimates both pieces by default.
+
+For a first fit, read `Sigma`, correlations, and communality before
+reading individual `Lambda` entries. The latent variables can be flipped or
+turned without changing the covariance they imply, so raw loading
+columns need a rotation or confirmatory constraint before they become a
+biological story.
+
+## First fit: wide individual-by-trait morphology
+
+We have `n` individuals, each measured once on `T` morphological traits.
+The biological question: do the traits covary
+on a small number of latent variables (e.g. a body-size axis, a shape
+axis)? With one observation per individual-trait pair, ordinary
+`latent()` estimates both the shared low-rank component and the
+trait-specific diagonal `Psi`. No spatial or phylogenetic structure
+here.
+
+```{r setup}
+library(gllvmTMB)
+```
+
+For a first fit, load the prepared morphometrics example object. It
+contains long data, wide data, and the truth table. The reproducible generator is
+`data-raw/examples/make-morphometrics-example.R`, but beginners do not
+need to read the generator before fitting the model.
+
+```{r example-data}
+example_path <- system.file(
+  "extdata", "examples", "morphometrics-example.rds",
+  package = "gllvmTMB"
+)
+if (!nzchar(example_path)) {
+  stop("Install gllvmTMB to use its morphometrics example data.")
+}
+morph <- readRDS(example_path)
+df <- morph$data_long
+df_wide <- morph$data_wide
+truth <- morph$truth
+trait_names <- truth$trait_names
+n_traits <- length(trait_names)
+Lambda_true <- truth$Lambda
+```
+
+```{r example-data-preview}
+morph$story$question
+head(df_wide, 3)
+head(df, 6)
+```
+
+The example has shared low-rank covariance
+$\boldsymbol\Lambda\boldsymbol\Lambda^\top$ plus per-trait diagonal
+variance $\boldsymbol\Psi$. The fit below recovers the individual-level
+covariance via ordinary `latent()`.
+
+In wide data, the formula term is
+`latent(1 | individual, d = 2)`. In long data, the equivalent term is
+`latent(0 + trait | individual, d = 2)`. The `1` in the wide form is
+the compact shorthand for the same trait-specific columns used in the
+long form.
+
+Fit a `d = 2` reduced-rank GLLVM with ordinary `latent()` at the
+individual level: the shared low-rank structure plus trait-specific
+unique variance, which ordinary `latent()` carries by default:
+
+```{r fit-call}
+fit <- gllvmTMB(
+  traits(length, mass, wing, tarsus, bill) ~ 1 +
+    latent(1 | individual, d = 2),
+  data = df_wide,
+  unit = "individual",
+  family = gaussian()
+)
+
+# A finite likelihood confirms that the model fitted; diagnostics come next.
+as.numeric(logLik(fit))
+```
+
+### Same model, long data
+
+If your workflow already stores one row per `(individual, trait)`
+observation, use the same entry point with the long formula and explicit
+`trait =` argument. Internally the wide formula pivots to this stacked
+form, so the two calls fit the same model; the log-likelihoods agree:
+
+```{r fit-long}
+fit_long <- gllvmTMB(
+  value ~ 0 + trait + latent(0 + trait | individual, d = 2),
+  data = df,
+  trait = "trait",
+  unit = "individual",
+  family = gaussian()
+)
+
+# Same fit:
+all.equal(as.numeric(logLik(fit)), as.numeric(logLik(fit_long)))
+```
+
+### What if some response cells are missing?
+
+Wide trait tables do not need to be perfectly rectangular. If an
+individual is missing one trait measurement, leave that response cell as
+`NA`; `gllvmTMB()` can treat only that unit-trait cell as missing and
+keep the other observed traits for the individual. The same rule applies
+to long data with `NA` in the response column. Missing predictors and
+missing grouping variables are a separate problem: by default they fail
+loudly because the model cannot construct that row.
+
+## Check the fitted response distribution
+
+Before interpreting `Sigma`, separate two questions. First, ask whether
+the numerical fit looks healthy. Then ask whether the fitted response
+distribution is visibly mismatched to the observed stacked traits. For
+this Gaussian example, use `check_gllvmTMB()` first; if a row is not
+`PASS`, read its `action` before interpreting covariance. The residual
+and predictive-check plots are diagnostic displays here. They do not
+prove the latent rank or calibrate uncertainty intervals.
+
+```{r fit-health}
+health <- check_gllvmTMB(fit)
+health[, c("component", "status", "message", "action")]
+```
+
+Each individual-trait cell has one observation, and the fitted diagonal
+`Psi` term is indexed at that same cell resolution. Exact conditional Gaussian
+residuals would therefore be almost zero and would make a misleadingly perfect
+Q-Q plot. Instead, use simulation-rank residuals from new fitted-model draws
+with random effects regenerated (`condition_on_RE = FALSE`).
+
+```{r residual-table}
+rq <- residuals(
+  fit,
+  type = "simulation_rank",
+  nsim = 199,
+  seed = 1,
+  condition_on_RE = FALSE
+)
+head(rq[, c("trait", "family", "observed", "residual", "status")], 8)
+stopifnot(diff(range(rq$residual, na.rm = TRUE)) > 1)
+```
+
+Use the plot as a quick fitted-response check before turning to
+covariance interpretation:
+
+```{r residual-qq, fig.width = 6.2, fig.height = 4.2, out.extra='class="wide-scientific-figure"', fig.cap = "Marginal simulation-rank residual Q-Q check for the fitted Gaussian morphometrics model. New random effects are generated for each fitted-model draw. The plot is a diagnostic display, not interval calibration or a posterior predictive check."}
+predictive_check(
+  fit,
+  type = "rq_qq",
+  residual_type = "simulation_rank",
+  nsim = 199,
+  seed = 1,
+  condition_on_RE = FALSE
+)
+```
+
+## Read the covariance summaries first
+
+Start with the fitted `Sigma` rows. These rows describe the covariance
+surface implied by the model, not a separate model:
+
+```{r sigma-table}
+sigma_rows <- extract_Sigma_table(fit, level = "unit")
+sigma_rows
+```
+
+The full covariance target is stored in the example object, so this
+teaching example can show what the fitted model is trying to recover:
+
+```{r sigma-truth}
+round(truth$Sigma, 2)
+```
+
+Ordination of individuals on the two latent axes. These axes come from
+the fitted latent model
+($\boldsymbol\Sigma = \boldsymbol\Lambda\boldsymbol\Lambda^\top + \boldsymbol\Psi$),
+not an eigen-decomposition of the raw data; this is model-based
+ordination, not PCA or NMDS:
+
+```{r ord, fig.cap = "Individual scores on the two latent trait axes."}
+ord <- extract_ordination(fit, level = "unit")
+plot(ord$scores[, 1], ord$scores[, 2], pch = 19, col = "steelblue",
+     xlab = "LV 1", ylab = "LV 2",
+     main = "Individuals on latent trait axes")
+abline(h = 0, v = 0, lty = 2, col = "grey70")
+```
+
+That's the whole model: `latent()` for shared trait covariance and the
+diagonal trait-specific $\boldsymbol\Psi$ component, plus trait-specific
+intercepts.
+
+Per-trait communality $c_t^2$ is the proportion of each trait's
+variance shared with the others:
+
+```{r communality}
+extract_communality(fit, "unit")
+```
+
+Pairwise trait correlations are point estimates by default. This is the safest
+general summary because interval calibration depends on the fitted target and
+model. `method = "fisher-z"` adds fast heuristic bounds, and
+`method = "bootstrap"` is a slower target-specific option. Nonlinear profile
+intervals for correlations are unavailable. Neither supported interval route
+is universally calibrated.
+
+```{r cor}
+corr_rows <- extract_correlations(fit, tier = "unit")
+corr_rows
+```
+
+For reports, plot the same tidy rows instead of hand-indexing a
+correlation matrix:
+
+```{r cor-plot, fig.width = 7, fig.height = 3.8, fig.cap = "Pairwise point estimates of trait correlations from the first fitted model. No interval bounds are requested in this first-fit view."}
+plot_correlations(corr_rows, sort = "magnitude")
+```
+
+The matrix form displays the same point estimates by trait pair.
+No interval bounds were requested. The plot does not compute or
+calibrate uncertainty itself.
+
+```{r cor-matrix, fig.width = 7.4, fig.height = 5.1, out.extra='class="wide-scientific-figure"', fig.cap = "Point estimates of trait correlations from the first fitted model. The matrix is descriptive; interval routes are target-specific and opt-in."}
+plot_correlations(
+  corr_rows,
+  style = "heatmap",
+  matrix_layout = "by_level",
+  label_type = "estimate",
+  title = "First-model trait correlations"
+)
+```
+
+The correlation results above are point estimates only. Profile intervals for
+correlations are unavailable. The separate total-variance route targets the
+diagonal of `Sigma`, not correlation. This example profiles one trait, chosen
+from the simulated truth table, and prints the interval status with its bounds.
+With real data, choose the trait to profile from the scientific question and pass
+its index with `trait_idx`; the simulated truth is used here only to make this
+example's choice reproducible.
+
+```{r total-variance-profile}
+profile_trait <- which.max(diag(truth$Sigma))
+total_variance_ci <- profile_ci_total_variance(
+  fit,
+  tier = "unit",
+  trait_idx = profile_trait
+)
+total_variance_ci[, c(
+  "trait", "estimate", "lower", "upper", "interval_status"
+)]
+```
+
+`certified-0.94` means the fit falls inside one simulated Gaussian regime
+(unpenalised native-Laplace, `n_units >= 150`, `d <= 2`, and a two-sided
+95% input). Its measured 0.9467 marginal coverage is a 0.94 floor, not nominal
+95% coverage or a guarantee for an individual interval. `route-only` means
+the bounds were computed outside that measured regime. The installed help
+`?profile_ci_total_variance` lists the exact target and status rules. These
+total-variance intervals do not apply to the correlations shown above.
+
+## Choose a covariance source and level
+
+`unit` is the between-unit covariance grouping, called `B` in older output.
+`unit_obs` is the within-unit observation grouping, called `W` in older output;
+each `unit_obs` level must be nested within one `unit`. These groupings are
+different from covariance source families:
+
+| Component | Keyword family | What identifies it |
+|---|---|---|
+| Between-unit or within-unit covariance | `indep()`, `dep()`, `latent()` | Use `unit` or `unit_obs` as the grouping factor in the formula. |
+| Animal relatedness | `animal_indep()`, `animal_dep()`, `animal_latent()` | A pedigree, `A`, or `Ainv` supplies relatedness for the animal IDs. |
+| Phylogenetic relatedness | `phylo_indep()`, `phylo_dep()`, `phylo_latent()` | A tree or `vcv` matrix supplies relatedness on the cluster axis, usually species. |
+| Spatial fields | `spatial_indep()`, `spatial_dep()`, `spatial_latent()` | A mesh built from the fitted locations supplies the spatial structure. |
+| Known kernel | `kernel_indep()`, `kernel_dep()`, `kernel_latent()` | A supplied matrix `K` supplies relatedness or similarity. |
+
+The mode describes covariance among traits: `indep()` gives separate trait
+variances with no cross-trait covariance; `dep()` estimates an unstructured
+trait covariance; and `latent(..., d = K)` estimates a rank-`K` shared
+component. Ordinary `latent()` includes diagonal `Psi` by default. A
+source-specific `*_latent()` term is loadings-only by default; use
+`unique = TRUE` to add its source-specific diagonal `Psi`. The older ordinary
+pair `latent(..., unique = FALSE) + unique(...)` remains accepted for
+compatibility. Check the installed help for the selected keyword before
+combining covariance sources.
+
+## Then inspect loadings and scores
+
+The recovered loadings are useful, but they are not the first
+interpretation target. Only
+$\boldsymbol{\Lambda}\boldsymbol{\Lambda}^{\mathsf T}$ is identified
+directly from the data; raw loading columns can change sign or rotate.
+
+```{r loadings}
+Lambda_hat <- extract_loadings(fit, level = "unit")
+rownames(Lambda_hat) <- paste0("trait_", seq_len(n_traits))
+colnames(Lambda_hat) <- paste0("LV", seq_len(ncol(Lambda_hat)))
+round(Lambda_hat, 3)
+```
+
+Do not over-interpret the signs of these unrotated loadings. Use them
+as a quick look at the latent variables, then use `Sigma`, correlations, and
+communality for report-ready interpretation unless you have chosen a
+rotation or confirmatory constraint.
+
+The shared covariance from the loadings can still be compared with the
+known truth in this simulated teaching object. The off-diagonal pattern
+is what should agree; the full `Sigma` diagonal also includes `Psi`.
+
+```{r cov}
+list(true_LL  = round(Lambda_true %*% t(Lambda_true), 2),
+     fitted_LL = round(Lambda_hat  %*% t(Lambda_hat),  2))
+```
+
+That is the whole first model: trait-specific intercepts, individual
+latent scores, loadings from those scores to traits, and the diagonal
+`Psi` carried by ordinary `latent()`.
+
+## Choose your next guide
+
+The next step depends on the question, not on adding every available model
+component:
+
+- **Interpret covariance:** continue with
+  [Individual morphometrics](https://itchyshin.github.io/gllvmTMB/articles/morphometrics.html) for a fuller Gaussian worked
+  example.
+- **Check the fit:** use [Can I trust this fit?](https://itchyshin.github.io/gllvmTMB/articles/fit-diagnostics.html) before
+  relying on coefficients, covariance, or uncertainty.
+- **Choose a specialised model:** use the [Articles chooser](https://itchyshin.github.io/gllvmTMB/articles/index.html) to
+  select repeated behaviours, reaction norms, binary occurrence,
+  multivariate spatial structure, phylogenetic covariance, missing data, rank
+  selection, or a technical reference. The [spatial-model guide](https://itchyshin.github.io/gllvmTMB/articles/spatial-models.html)
+  shows mesh construction and equivalent long- and wide-format fits.
+
+Family, grouping structure, covariance source, covariance mode, missingness,
+and latent rank answer different scientific questions. Add only the pieces the
+sampling design and estimand require.
+
+## Acknowledgements
+
+`gllvmTMB` is a standalone TMB-based package. Its design acknowledges
+several earlier projects; incorporated code is recorded precisely in
+`inst/COPYRIGHTS`:
+
+* [**sdmTMB**](https://pbs-assess.github.io/sdmTMB/) (Anderson, Ward, English, Barnett, Thorson, et al.): the original spatial interface and helper layer were derived from its GPL-3 implementation. The current gllvmTMB helpers were substantially rewritten against the public `fmesher` API; sdmTMB remains a credited source rather than a runtime dependency. The [spatial-model guide](https://itchyshin.github.io/gllvmTMB/articles/spatial-models.html#provenance-acknowledgement-and-licensing) explains this provenance boundary (the helper implementation itself is covered by focused tests; broader spatial-family evidence remains partial).
+* [**glmmTMB**](https://glmmtmb.github.io/glmmTMB/) (Brooks, Bolker, Kristensen, Magnusson, Skaug, Nielsen, Berg, van Bentham, et al.): `rr` / `propto` / `equalto` / `diag` covariance dispatch. The reduced-rank `rr()` machinery in particular is the contribution of [**McGillycuddy, Popovic, Bolker & Warton (2025)**](https://doi.org/10.18637/jss.v112.i01) *J. Stat. Softw.* 112(1).
+* [**GALAMM**](https://cran.r-project.org/package=galamm) (Sørensen): mixed-response (`gfam`) and confirmatory fixed-loading (`lambda_constraint`) patterns.
+* [**MCMCglmm**](https://cran.r-project.org/package=MCMCglmm) (Hadfield): the sparse $A^{-1}$ phylogeny representation that `phylo_latent(tree = )` follows. gllvmTMB constructs it natively (`ape` + `Matrix` only) and does **not** call MCMCglmm at fit time; it is a test-only `Suggests`, used to cross-check the pedigree precision builder.
+* [**TMB**](https://github.com/kaskr/adcomp) (Kristensen et al.) and [**fmesher**](https://inlabru-org.github.io/fmesher/) (Lindgren): autodiff and finite-element mesh.
