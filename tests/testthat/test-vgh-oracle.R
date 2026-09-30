@@ -59,6 +59,7 @@ test_that("the long-to-wide reshape round-trips exactly", {
 ## up here.  The engine drops the c(y, phi) constant (it never moves the
 ## optimum), so it is added back for the comparison.
 test_that("gaussian ELBO equals the exact marginal log-likelihood", {
+  skip_on_cran()
   n <- 200L; T <- 10L; q <- 2L; sdv <- 1.3
   s <- .vgh_test_sim("gaussian_anchor", n, T, q, seed = 7L, sd_gauss = sdv)
   d <- .vgh_test_long(s$Y)
@@ -81,6 +82,7 @@ test_that("gaussian ELBO equals the exact marginal log-likelihood", {
 ## the SQUAREM extrapolation is guarded on the ELBO so it cannot either.  A
 ## single decrease means a block update or the guard is wrong.
 test_that("the ELBO is monotone for every admitted family", {
+  skip_on_cran()
   for (fam in c("gaussian_anchor", "poisson", "binomial")) {
     lk <- switch(fam, gaussian_anchor = "identity", poisson = "log",
                  binomial = "logit")
@@ -98,6 +100,7 @@ test_that("the ELBO is monotone for every admitted family", {
 ## The acceleration exists because 34 of 36 Poisson fits in the 2026-07-29
 ## matched grid hit a sweep cap.  It must not change WHERE the engine lands.
 test_that("SQUAREM reaches the same optimum in fewer sweeps", {
+  skip_on_cran()
   s <- .vgh_test_sim("poisson", n = 120L, T = 8L, q = 2L, seed = 21L)
   d <- .vgh_test_long(s$Y)
   args <- list(d$y, d$n_trials, d$X, d$unit_id, d$trait_id, q = 2L,
@@ -117,6 +120,7 @@ test_that("SQUAREM reaches the same optimum in fewer sweeps", {
 ## so the node count must be irrelevant to the answer.  If it is not, the
 ## `exact` flag is not being honoured.
 test_that("exact families are invariant to the quadrature order", {
+  skip_on_cran()
   s <- .vgh_test_sim("poisson", n = 100L, T = 6L, q = 2L, seed = 31L)
   d <- .vgh_test_long(s$Y)
   fits <- lapply(c(5L, 25L), function(Q) {
@@ -132,7 +136,11 @@ test_that("exact families are invariant to the quadrature order", {
 ## multiplied by the trial count; a Binomial(n, p) datum must give the same
 ## fitted linear predictor as n separate Bernoulli(p) rows would in expectation,
 ## and at minimum must run, converge, and place the loadings sensibly.
-test_that("binomial admits n_trials > 1 and rejects impossible counts", {
+test_that("binomial admits n_trials > 1", {
+  ## This 120 x 8 variational fit is an expensive developer oracle. Keep it
+  ## active in local and CI runs, but leave the fast input-rejection check
+  ## below active on CRAN.
+  skip_on_cran()
   set.seed(41)
   n <- 120L; T <- 8L; q <- 2L
   s <- .vgh_test_sim("binomial", n, T, q, seed = 41L)
@@ -145,11 +153,14 @@ test_that("binomial admits n_trials > 1 and rejects impossible counts", {
                 maxit = 800L)
   expect_true(f$converged)
   expect_true(all(is.finite(f$Lambda)))
+})
 
-  bad <- d; bad$y[1] <- bad$n_trials[1] + 1      # y > n_trials
+test_that("binomial rejects counts above n_trials before fitting", {
+  bad <- .vgh_test_long(matrix(0L, nrow = 2L, ncol = 2L))
+  bad$y[1] <- bad$n_trials[1] + 1L              # y > n_trials
   expect_error(
-    .vgh_fit(bad$y, bad$n_trials, bad$X, bad$unit_id, bad$trait_id, q = q,
-             N = n, T = T, family = "binomial", link = "logit"),
+    .vgh_fit(bad$y, bad$n_trials, bad$X, bad$unit_id, bad$trait_id, q = 1L,
+             N = 2L, T = 2L, family = "binomial", link = "logit"),
     "integer counts in 0\\.\\.n_trials")
 })
 
@@ -203,6 +214,7 @@ test_that("the Gauss-Hermite rule is the probabilists' rule", {
 ## here verbatim, and it is what proves the q = 1 algebra is right rather than
 ## merely non-crashing.
 test_that("gaussian ELBO equals the exact marginal log-likelihood at q = 1", {
+  skip_on_cran()
   n <- 200L; T <- 10L; q <- 1L; sdv <- 1.3
   s <- .vgh_test_sim("gaussian_anchor", n, T, q, seed = 7L, sd_gauss = sdv)
   d <- .vgh_test_long(s$Y)
@@ -227,6 +239,7 @@ test_that("gaussian ELBO equals the exact marginal log-likelihood at q = 1", {
 
 
 test_that("the ELBO is monotone at q = 1 for every admitted family", {
+  skip_on_cran()
   for (fam in c("gaussian_anchor", "poisson", "binomial")) {
     lk <- switch(fam, gaussian_anchor = "identity", poisson = "log",
                  binomial = "logit")
@@ -262,6 +275,7 @@ test_that("VGH adds no public surface", {
 ## so the last increment is large enough that reporting the previous sweep's
 ## value is detectably wrong -- the check a stale answer cannot satisfy.
 test_that("reported elbo is the objective at the returned parameters", {
+  skip_on_cran()
   n <- 200L; T <- 10L; q <- 2L; sdv <- 1.3
   s <- .vgh_test_sim("gaussian_anchor", n, T, q, seed = 7L, sd_gauss = sdv)
   d <- .vgh_test_long(s$Y)

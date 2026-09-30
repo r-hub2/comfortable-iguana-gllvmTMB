@@ -69,7 +69,17 @@ test_that("morphometrics example object has matching long and wide shapes", {
 
 test_that("morphometrics example long and wide fits agree and recover truth", {
   ex <- load_morphometrics_example()
-  ctl <- gllvmTMBcontrol(se = FALSE)
+  ## Keep BFGS tight enough for the independent gradient gate while avoiding
+  ## the platform-sensitive false-convergence result seen at 1e-12 on macOS
+  ## R 4.6.1.
+  ctl <- gllvmTMBcontrol(
+    se = FALSE,
+    optimizer = "optim",
+    optArgs = list(
+      method = "BFGS",
+      control = list(maxit = 1000, reltol = 1e-11)
+    )
+  )
 
   fit_long <- suppressMessages(gllvmTMB(
     ex$formula_long,

@@ -3,9 +3,11 @@
 #' @title gllvmTMB: Generalised Linear Latent Variable Models with TMB
 #' @useDynLib gllvmTMB, .registration = TRUE
 #' @section Current limitations and boundaries:
-#' Before choosing a family, covariance source, estimator, or interval method,
-#' read the
-#' [current limitations and boundaries](https://itchyshin.github.io/gllvmTMB/articles/current-limits.html).
+#' The online [current limitations and boundaries
+#' page](https://itchyshin.github.io/gllvmTMB/articles/current-limits.html)
+#' follows the development version and may describe changes made after 0.7.1.
+#' For the scope and restrictions of 0.7.1, use this release's NEWS and the
+#' help and vignettes installed with the package.
 #' @keywords internal
 "_PACKAGE"
 
@@ -17,7 +19,8 @@
     "output, but evidence is route- and regime-specific. Broad interval ",
     "coverage is not certified. One narrow two-sided ",
     "Gaussian total-variance profile regime has a documented 0.94 floor. ",
-    "See the Current limitations and boundaries page for scope."
+    "For 0.7.1 scope, see its installed help, vignettes, and NEWS. The ",
+    "online limitations page may differ as development continues."
   )
 }
 

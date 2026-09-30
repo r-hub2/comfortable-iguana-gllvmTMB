@@ -550,8 +550,8 @@
 #' conditional-joint and marginal quantities from different penalty regimes.
 #'
 #' @seealso [screen_gllvmTMB()] for the opt-in fixed-design separation
-#'   certificate; \code{vignette("mspl-binary-jsdm", package = "gllvmTMB")}
-#'   for the screen-first LA-MSPL workflow; [traits()] for wide data-frame formula input;
+#'   certificate to use before fitting; `estimator = "mspl"` is documented
+#'   in this topic. [traits()] for wide data-frame formula input;
 #'   [gllvmTMB_wide()] for wide matrix/data-frame input;
 #'   [simulate_site_trait()] for
 #'   generating recovery test data;
@@ -1639,8 +1639,8 @@ drop_missing_response_rows <- function(fixed_formula, data, weights = NULL,
 #'
 #'   **Historical explicit-JJ evidence.** Recovery of the ordination below was
 #'   measured with the earlier JJ evaluator against planted truth at the
-#'   admitted cells (`d = 2`, 8 responses, n = 150 and 400, 50 seeds per cell;
-#'   `dev/va-usability/A2-ATTENUATION.md`), with the Laplace route run on the
+#'   admitted cells (`d = 2`, 8 responses, n = 150 and 400, 50 seeds per cell),
+#'   with the Laplace route run on the
 #'   same simulated data as a control. This campaign predates the current
 #'   automatic Gauss-Hermite default and must not be used as evidence for the
 #'   accuracy of the current GH-default route:
