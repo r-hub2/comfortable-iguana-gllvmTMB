@@ -424,6 +424,7 @@ test_that("R3 nbinom2 fit is alive: simulate-then-fit returns a healthy status",
 })
 
 test_that("R3 fixed-parameter information marginalises the variational block", {
+  skip_on_cran()
   set.seed(9191)
   n <- 60L; p <- 5L
   trait_names <- paste0("sp", seq_len(p))
@@ -982,6 +983,8 @@ test_that("R3 small-variance expansion is insensitive across switch candidates",
 }
 
 test_that("R3 Gaussian variational posterior equals the analytic posterior", {
+  # Internal fit oracle for the paused VA/EVA prototype; keep in local/CI tests.
+  skip_on_cran()
   z <- .va_r3_gaussian_fixture()
   fit <- .va_r3_fit(
     y = z$y, n_trials = rep(1L, length(z$y)), X = z$X,
@@ -1160,6 +1163,9 @@ test_that("R3 Gaussian variational gradients match analytic matrix derivatives",
 }
 
 test_that("R3 fixed-coordinate q=1/q=2 cells pass the AGHQ admission gate", {
+  # These private prototype-to-AGHQ fit comparisons are outside 0.7.1 scope.
+  skip_on_cran()
+
   comparisons <- list(
     q1 = .va_r3_r2_comparison(1L, 20260719L),
     q2 = .va_r3_r2_comparison(2L, 20260720L)
@@ -1843,6 +1849,8 @@ test_that("the polish target stays stricter than the health bar", {
 })
 
 test_that("the reported gradient_tolerance is the one actually applied", {
+  # Internal optimizer diagnostic for the paused VA/EVA prototype.
+  skip_on_cran()
   ## The reported value and the applied value were separate literals; they could
   ## drift apart with nothing to catch it. They are now one constant, and this
   ## asserts the report reflects it.
